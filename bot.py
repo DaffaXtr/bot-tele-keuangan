@@ -50,8 +50,12 @@ logging.basicConfig(
 ) = range(1, 8)
 
 # Token Bot Telegram & Authorization Whitelist (Mendukung ID Angka mau pun Username)
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8715605746:AAEzkH13zGv4hP6BRvNl9AyFMzM-Gd9U4Aw")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 ALLOWED_USER_ID_RAW = os.getenv("ALLOWED_USER_ID", "").strip()
+
+if not TOKEN:
+    print("❌ ERROR: TELEGRAM_BOT_TOKEN tidak ditemukan di berkas .env! Silakan isi TELEGRAM_BOT_TOKEN Anda.")
+    exit(1)
 
 DB_NAME = "keuangan.db"
 PER_PAGE = 5  # Item per halaman di riwayat
