@@ -1,5 +1,7 @@
-# Environment variables (Sangat Rahasia - Berisi Token & Telegram User ID)
+# Environment variables & Google Credentials (Sangat Rahasia)
 .env
+credentials.json
+*.json
 
 # Database SQLite (Cadangan Data Keuangan Pribadi)
 *.db

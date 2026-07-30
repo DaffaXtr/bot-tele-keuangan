@@ -32,6 +32,14 @@ from telegram.ext import (
     filters,
 )
 
+# Integrasi Google Sheets (Spreadsheet) API
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+    HAS_GSPREAD = True
+except ImportError:
+    HAS_GSPREAD = False
+
 # Logging untuk pemantauan status bot di terminal
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -49,10 +57,18 @@ logging.basicConfig(
     ADD_CAT_NAME_STATE,
 ) = range(1, 8)
 
-# Token Bot Telegram & Konfigurasi Admin Utama
+# Token Bot Telegram & Authorization Whitelist
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-MAIN_ADMIN_USERNAME = os.getenv("MAIN_ADMIN_USERNAME", "dapxtr").strip().lstrip("@").lower()
-MAIN_ADMIN_ID_RAW = os.getenv("MAIN_ADMIN_ID", "").strip()
+ALLOWED_USER_ID_RAW = os.getenv("ALLOWED_USER_ID", "").strip()
+
+raw_sheet_id = os.getenv("GOOGLE_SHEET_ID", "").strip()
+if "/d/" in raw_sheet_id:
+    match = re.search(r"/d/([a-zA-Z0-9-_]+)", raw_sheet_id)
+    GOOGLE_SHEET_ID = match.group(1) if match else raw_sheet_id
+else:
+    GOOGLE_SHEET_ID = raw_sheet_id
+
+GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json").strip()
 
 if not TOKEN:
     print("❌ ERROR: TELEGRAM_BOT_TOKEN tidak ditemukan di berkas .env! Silakan isi TELEGRAM_BOT_TOKEN Anda.")
@@ -65,88 +81,327 @@ PER_PAGE = 5  # Item per halaman di riwayat
 DEFAULT_PENGELUARAN_KATEGORI = ["🍔 Makanan", "🚗 Transportasi", "🛍️ Belanja", "🏠 Tagihan", "🎬 Hiburan", "💊 Kesehatan", "📦 Lainnya"]
 DEFAULT_PEMASUKAN_KATEGORI = ["💼 Gaji", "🎁 Bonus", "📈 Investasi", "💵 Usaha", "📦 Lainnya"]
 
-def is_main_admin_user(user) -> bool:
-    if not user:
-        return False
-    if MAIN_ADMIN_ID_RAW and str(user.id) == MAIN_ADMIN_ID_RAW:
-        return True
-    return bool(MAIN_ADMIN_USERNAME and user.username and user.username.lower() == MAIN_ADMIN_USERNAME)
-
-def upsert_user(user) -> None:
-    if not user:
-        return
-    role = "admin" if is_main_admin_user(user) else "user"
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO users (user_id, username, first_name, last_name, role, status, created_at, last_seen_at)
-            VALUES (?, ?, ?, ?, ?, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            ON CONFLICT(user_id) DO UPDATE SET
-                username = excluded.username,
-                first_name = excluded.first_name,
-                last_name = excluded.last_name,
-                role = CASE WHEN excluded.role = 'admin' THEN 'admin' ELSE users.role END,
-                last_seen_at = CURRENT_TIMESTAMP
-            """,
-            (user.id, user.username, user.first_name, user.last_name, role),
-        )
-        conn.commit()
-
-def get_user_status(user_id: int) -> str:
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT status FROM users WHERE user_id = ?", (user_id,))
-        row = cursor.fetchone()
-    return row[0] if row else "active"
-
-def get_user_role(user_id: int) -> str:
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT role FROM users WHERE user_id = ?", (user_id,))
-        row = cursor.fetchone()
-    return row[0] if row else "user"
-
-def is_admin_id(user_id: int) -> bool:
-    return get_user_role(user_id) == "admin"
-
-# Middleware otorisasi multi-user: semua user aktif boleh memakai bot.
+# Middleware Pengecekan Otorisasi Pengguna
 async def is_authorized(update: Update) -> bool:
+    if not ALLOWED_USER_ID_RAW:
+        return True
+
     user = update.effective_user
     if not user:
         return False
 
-    upsert_user(user)
-    if get_user_status(user.id) != "active":
-        msg = (
-            "🔒 <b>Akses Ditolak!</b>\n\n"
-            "Akun Anda sedang diblokir oleh admin utama."
-        )
-        if update.callback_query:
-            await update.callback_query.answer("🔒 Akun diblokir.", show_alert=True)
-        elif update.message:
-            await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
-        return False
-    return True
+    target = ALLOWED_USER_ID_RAW.lstrip("@").lower()
 
-async def is_admin_authorized(update: Update) -> bool:
-    if not await is_authorized(update):
-        return False
-    user = update.effective_user
-    if user and is_admin_id(user.id):
+    if user.username and user.username.lower() == target:
         return True
 
-    msg = "🔒 Fitur ini hanya untuk admin utama."
+    if str(user.id) == target:
+        return True
+
+    msg = (
+        "🔒 <b>Akses Ditolak!</b>\n\n"
+        "Maaf, bot keuangan ini telah diproteksi khusus untuk penggunaan pribadi pemiliknya."
+    )
     if update.callback_query:
-        await update.callback_query.answer(msg, show_alert=True)
+        await update.callback_query.answer("🔒 Akses Ditolak!", show_alert=True)
     elif update.message:
-        await update.message.reply_text(msg)
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
     return False
 
-# Helper Pembersih Emoji untuk Label Matplotlib (Menghindari Karakter Kotak [?])
+# Helper Pembersih Emoji untuk Label Matplotlib
 def strip_emoji(text: str) -> str:
     clean = re.sub(r'[^\w\s-]', '', text).strip()
     return clean if clean else text
+
+# --- ENGINE INTEGRASI & STYLING PREMIUM GOOGLE SHEETS ---
+def get_gspread_client():
+    if not HAS_GSPREAD:
+        return None
+    if not os.path.exists(GOOGLE_CREDENTIALS_FILE) or not GOOGLE_SHEET_ID:
+        return None
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    try:
+        creds = Credentials.from_service_account_file(GOOGLE_CREDENTIALS_FILE, scopes=scopes)
+        client = gspread.authorize(creds)
+        return client
+    except Exception as e:
+        logging.error(f"Gagal otentikasi Google Sheets API: {e}")
+        return None
+
+def format_google_sheet(sheet, last_tx_row: int):
+    """
+    Merapikan tampilan Google Spreadsheet secara otomatis:
+    - Header: Dark Navy Blue (#1F4E79), Teks Putih Tebal, Freeze Header Row 1.
+    - Color Coding Pemasukan (Hijau Soft) vs Pengeluaran (Merah Soft).
+    - Baris Total Ringkasan di Paling Bawah (Total Masuk, Total Keluar, Saldo Akhir).
+    """
+    try:
+        sheet.freeze(rows=1)
+
+        # Header format: Navy background, White Bold text, Centered
+        sheet.format("A1:F1", {
+            "backgroundColor": {"red": 0.12, "green": 0.31, "blue": 0.47},
+            "textFormat": {"foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}, "bold": True, "fontSize": 10},
+            "horizontalAlignment": "CENTER",
+            "verticalAlignment": "MIDDLE"
+        })
+
+        all_vals = sheet.get_all_values()
+        total_rows = len(all_vals)
+
+        # Format Kolom Data Transaksi (A2 sampai last_tx_row)
+        if last_tx_row >= 2:
+            sheet.format(f"A2:A{last_tx_row}", {"horizontalAlignment": "CENTER"})
+            sheet.format(f"B2:B{last_tx_row}", {"horizontalAlignment": "CENTER"})
+            sheet.format(f"C2:C{last_tx_row}", {"horizontalAlignment": "CENTER"})
+            sheet.format(f"D2:D{last_tx_row}", {
+                "horizontalAlignment": "RIGHT",
+                "numberFormat": {"type": "CURRENCY", "pattern": '"Rp "#,##0'}
+            })
+            sheet.format(f"E2:E{last_tx_row}", {"horizontalAlignment": "LEFT"})
+            sheet.format(f"F2:F{last_tx_row}", {"horizontalAlignment": "LEFT"})
+
+            # Color coding per baris data
+            for r_idx in range(2, last_tx_row + 1):
+                jenis_val = all_vals[r_idx - 1][2] if len(all_vals[r_idx - 1]) > 2 else ""
+                if jenis_val == "Pemasukan":
+                    sheet.format(f"A{r_idx}:F{r_idx}", {
+                        "backgroundColor": {"red": 0.83, "green": 0.94, "blue": 0.85}  # Soft Green
+                    })
+                elif jenis_val == "Pengeluaran":
+                    sheet.format(f"A{r_idx}:F{r_idx}", {
+                        "backgroundColor": {"red": 0.97, "green": 0.84, "blue": 0.85}  # Soft Red
+                    })
+
+        # Format Baris Ringkasan Total di Bawah
+        if total_rows >= last_tx_row + 4:
+            row_masuk = last_tx_row + 2
+            row_keluar = last_tx_row + 3
+            row_saldo = last_tx_row + 4
+
+            # Total Pemasukan Row (Soft Green)
+            sheet.format(f"B{row_masuk}:F{row_masuk}", {
+                "backgroundColor": {"red": 0.75, "green": 0.92, "blue": 0.78},
+                "textFormat": {"bold": True},
+            })
+
+            # Total Pengeluaran Row (Soft Red)
+            sheet.format(f"B{row_keluar}:F{row_keluar}", {
+                "backgroundColor": {"red": 0.96, "green": 0.77, "blue": 0.78},
+                "textFormat": {"bold": True},
+            })
+
+            # Saldo Akhir Row (Golden Yellow Accent)
+            sheet.format(f"B{row_saldo}:F{row_saldo}", {
+                "backgroundColor": {"red": 1.0, "green": 0.93, "blue": 0.70},
+                "textFormat": {"bold": True, "fontSize": 11},
+            })
+
+            # Currency Format untuk D_Total
+            sheet.format(f"D{row_masuk}:D{row_saldo}", {
+                "horizontalAlignment": "RIGHT",
+                "numberFormat": {"type": "CURRENCY", "pattern": '"Rp "#,##0'}
+            })
+
+    except Exception as e:
+        logging.error(f"Gagal melakukan formatting Google Sheet: {e}")
+
+def sync_all_transactions_to_google_sheet(user_id: int):
+    client = get_gspread_client()
+    if not client:
+        return False, "Google Sheet ID atau berkas credentials.json belum dikonfigurasi di server."
+
+    try:
+        sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
+        sheet.clear()
+        sheet.append_row(["ID Transaksi", "Waktu & Tanggal", "Jenis", "Nominal (Rp)", "Kategori", "Keterangan"])
+
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, tanggal, jenis, nominal, kategori, keterangan FROM transaksi WHERE user_id = ? ORDER BY id ASC", (user_id,))
+            rows = cursor.fetchall()
+
+        if not rows:
+            format_google_sheet(sheet, 1)
+            return True, "Semua data transaksi di-sync (kosong)."
+
+        data_rows = []
+        tot_masuk = 0.0
+        tot_keluar = 0.0
+
+        for r in rows:
+            tx_id, tgl, jenis, nom, kat, ket = r
+            data_rows.append([tx_id, str(tgl), jenis, nom, kat, ket])
+            if jenis == "Pemasukan":
+                tot_masuk += float(nom or 0)
+            elif jenis == "Pengeluaran":
+                tot_keluar += float(nom or 0)
+
+        sheet.append_rows(data_rows)
+        
+        last_tx_row = len(data_rows) + 1
+        saldo_akhir = tot_masuk - tot_keluar
+
+        summary_rows = [
+            ["", "", "", "", "", ""],
+            ["", "TOTAL PEMASUKAN", "Pemasukan", tot_masuk, "", "📥 Total Uang Masuk"],
+            ["", "TOTAL PENGELUARAN", "Pengeluaran", tot_keluar, "", "📤 Total Uang Keluar"],
+            ["", "SALDO AKHIR", "Saldo", saldo_akhir, "", "💰 Sisa Uang / Saldo Bersih"]
+        ]
+        sheet.append_rows(summary_rows, value_input_option="USER_ENTERED")
+
+        format_google_sheet(sheet, last_tx_row)
+        return True, f"Berhasil men-sync {len(data_rows)} transaksi + Ringkasan Total ke Google Sheets!"
+    except Exception as e:
+        return False, f"Terjadi kesalahan saat sync ke Google Sheets: {e}"
+
+def append_transaction_to_google_sheet(tx_id, jenis, nominal, kategori, keterangan, tanggal):
+    client = get_gspread_client()
+    if not client:
+        return False
+    try:
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT user_id FROM transaksi WHERE id = ?", (tx_id,))
+            row = cursor.fetchone()
+            if row:
+                user_id = row[0]
+                ok, _ = sync_all_transactions_to_google_sheet(user_id)
+                return ok
+        return False
+    except Exception as e:
+        logging.error(f"Gagal append transaksi #{tx_id} ke Google Sheets: {e}")
+        return False
+
+# --- MATCH PERINTAH FLEKSIBEL (FUZZY & SYNONYM MATCHING) ---
+def match_flexible_command_intent(text: str) -> str:
+    raw = text.lower().strip()
+    clean = re.sub(r'[^\w\s]', '', raw).strip()
+    
+    if any(k in clean for k in ["batal", "cancel", "stop", "abort"]):
+        return "batal"
+    if any(k in clean for k in ["rekap", "saldo", "summary", "sisa uang", "total saldo", "keuangan", "laporan bulanan"]):
+        return "rekap"
+    if any(k in clean for k in ["riwayat", "history", "catatan", "daftar", "list transaksi", "cek riwayat"]):
+        return "riwayat"
+    if any(k in clean for k in ["grafik", "chart", "diagram", "pie", "lihat grafik"]):
+        return "grafik"
+    if any(k in clean for k in ["budget", "anggaran", "target budget"]):
+        return "budget"
+    if any(k in clean for k in ["export", "unduh", "download", "pdf", "excel", "csv"]):
+        return "export"
+    if any(k in clean for k in ["admin", "kelola", "kategori", "pengaturan", "setting"]):
+        return "admin"
+    if any(k in clean for k in ["backup", "cadangan", "database"]):
+        return "backup"
+    if any(k in clean for k in ["help", "bantuan", "panduan", "cara pakai", "bantu", "tanya"]):
+        return "bantuan"
+    if any(k in clean for k in ["sheet", "spreadsheet", "sps", "sync google"]):
+        return "sync_sheet"
+    if any(k in clean for k in ["tambah pemasukan", "tambah masuk", "catat pemasukan"]):
+        return "prompt_pemasukan"
+    if any(k in clean for k in ["tambah pengeluaran", "tambah keluar", "catat pengeluaran"]):
+        return "prompt_pengeluaran"
+
+    return None
+
+# --- SMART NLP INTENT & CATEGORY CLASSIFIER ---
+def extract_nominal_from_sentence(text: str):
+    pattern = r"(?:\b|(?<=\s))(\d+(?:[.,]\d+)?)\s*(k|rb|ribu|jt|juta|m|miliar)?(?:\b|(?=\s))"
+    match = re.search(pattern, text, re.IGNORECASE)
+    if not match:
+        return None
+
+    raw_num = match.group(1)
+    unit = (match.group(2) or "").lower()
+    
+    multiplier = 1.0
+    if unit in ["k", "rb", "ribu"]:
+        multiplier = 1_000.0
+    elif unit in ["jt", "juta", "m"]:
+        multiplier = 1_000_000.0
+    elif unit in ["miliar"]:
+        multiplier = 1_000_000_000.0
+
+    if "." in raw_num and "," in raw_num:
+        raw_num = raw_num.replace(".", "").replace(",", ".")
+    elif "." in raw_num:
+        parts = raw_num.split(".")
+        if len(parts[-1]) == 3 and len(parts) > 1:
+            raw_num = raw_num.replace(".", "")
+    elif "," in raw_num:
+        raw_num = raw_num.replace(",", ".")
+
+    try:
+        nominal = float(raw_num) * multiplier
+    except ValueError:
+        return None
+
+    if nominal <= 0:
+        return None
+
+    keterangan = (text[:match.start()] + text[match.end():]).strip()
+    keterangan = re.sub(r'\s+', ' ', keterangan).strip()
+    if not keterangan:
+        keterangan = text.strip()
+
+    return nominal, keterangan, text.strip()
+
+def detect_jenis_and_kategori(full_text: str, user_id: int):
+    low = full_text.lower()
+
+    pemasukan_keywords = [
+        "dapat", "dapet", "gaji", "gajian", "terima", "diberi", "dikasih", 
+        "bonus", "transferan", "uang masuk", "sangu", "omset", "penjualan", 
+        "cashback", "cair", "dapat dari", "diberikan", "hadiah", "dapat saku",
+        "pemberian", "thr", "proyek", "freelance", "diisi ibu", "diberi ibu",
+        "dikasih ibu", "diberi ayah", "dikasih ayah", "masuk"
+    ]
+
+    is_pemasukan = any(kw in low for kw in pemasukan_keywords)
+    jenis = "Pemasukan" if is_pemasukan else "Pengeluaran"
+
+    clean_low = re.sub(r'[^\w\s]', '', low)
+
+    if jenis == "Pemasukan":
+        if any(k in clean_low for k in ["gaji", "gajian", "proyek", "freelance"]):
+            kategori = "💼 Gaji"
+        elif any(k in clean_low for k in ["bonus", "thr", "cashback", "omset"]):
+            kategori = "🎁 Bonus"
+        elif any(k in clean_low for k in ["investasi", "saham", "crypto"]):
+            kategori = "📈 Investasi"
+        elif any(k in clean_low for k in ["sangu", "ibu", "ayah", "dikasih", "diberi", "hadiah", "saku"]):
+            kategori = "🎁 Bonus"
+        else:
+            kategori = "💼 Gaji"
+    else:
+        if any(k in clean_low for k in ["makan", "minum", "ayam", "nasi", "kopi", "ngopi", "sate", "bakso", "teh", "snack", "roti", "pizza", "gorengan", "jus", "susu", "martabak", "geprek", "lunch", "dinner", "sarapan", "food", "resto", "warung"]):
+            kategori = "🍔 Makanan"
+        elif any(k in clean_low for k in ["bensin", "parkir", "grab", "gojek", "gocar", "goride", "ojek", "mrt", "krl", "tol", "pertamax", "pertalite", "karcis", "servis", "tambal", "ban"]):
+            kategori = "🚗 Transportasi"
+        elif any(k in clean_low for k in ["beli", "shopee", "tokped", "tokopedia", "baju", "celana", "sepatu", "indomaret", "alfamart", "skincare", "makeup", "tas"]):
+            kategori = "🛍️ Belanja"
+        elif any(k in clean_low for k in ["listrik", "air", "wifi", "indihome", "pdam", "pulsa", "kuota", "sewa", "kost", "token", "tagihan", "netflix", "spotify", "isix", "isi"]):
+            kategori = "🏠 Tagihan"
+        elif any(k in clean_low for k in ["nonton", "bioskop", "game", "steam", "topup", "hiburan", "liburan", "tiket"]):
+            kategori = "🎬 Hiburan"
+        elif any(k in clean_low for k in ["obat", "dokter", "apotek", "vitamin", "sakit", "rs", "klinik", "sehat"]):
+            kategori = "💊 Kesehatan"
+        else:
+            kategori = "📦 Lainnya"
+
+    user_cats = get_user_categories(user_id, jenis)
+    for c in user_cats:
+        c_clean = strip_emoji(c).lower().strip()
+        if c_clean and c_clean in clean_low:
+            kategori = c
+            break
+
+    return jenis, kategori
 
 # Class untuk Dokumen PDF Report
 class PDFReport(FPDF):
@@ -163,17 +418,15 @@ class PDFReport(FPDF):
         self.cell(0, 10, f"Halaman {self.page_no()}/{{nb}}", align="C")
 
 # Keyboard Utama
-def get_main_keyboard(user_id: int = None):
+def get_main_keyboard():
     keyboard = [
         [KeyboardButton("📊 Rekap Keuangan"), KeyboardButton("📈 Grafik Visual")],
         [KeyboardButton("📋 Riwayat Transaksi"), KeyboardButton("🎯 Set Budget")],
         [KeyboardButton("📥 Tambah Pemasukan"), KeyboardButton("📤 Tambah Pengeluaran")],
-        [KeyboardButton("📑 Export Laporan"), KeyboardButton("⚙️ Pengaturan Saya")],
-        [KeyboardButton("❓ Bantuan")],
-        [KeyboardButton("❌ Batal")]
+        [KeyboardButton("📑 Export Laporan"), KeyboardButton("🟢 Sync Google Sheets")],
+        [KeyboardButton("⚙️ Admin & Kelola"), KeyboardButton("📦 Backup DB")],
+        [KeyboardButton("❓ Bantuan"), KeyboardButton("❌ Batal")]
     ]
-    if user_id and is_admin_id(user_id):
-        keyboard.insert(-2, [KeyboardButton("🛡️ Admin Utama"), KeyboardButton("📦 Backup DB")])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 # Format Angka ke Rupiah Indonesia
@@ -230,7 +483,7 @@ def parse_nominal(raw_str: str) -> float:
     nom, _ = parse_nominal_and_keterangan(raw_str)
     return nom
 
-# Inisialisasi Database, Migrasi, & Optimalisasi Indeks
+# Inisialisasi Database
 def init_db():
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
@@ -244,19 +497,6 @@ def init_db():
                 keterangan TEXT,
                 tanggal TIMESTAMP,
                 kategori TEXT DEFAULT 'Umum'
-            )
-        """)
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                role TEXT DEFAULT 'user',
-                status TEXT DEFAULT 'active',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_seen_at TIMESTAMP
             )
         """)
 
@@ -284,18 +524,6 @@ def init_db():
                 nama_kategori TEXT
             )
         """)
-
-        cursor.execute("""
-            INSERT OR IGNORE INTO users (user_id, role, status, created_at)
-            SELECT DISTINCT user_id,
-                   CASE WHEN CAST(user_id AS TEXT) = ? THEN 'admin' ELSE 'user' END,
-                   'active',
-                   CURRENT_TIMESTAMP
-            FROM transaksi
-            WHERE user_id IS NOT NULL
-        """, (MAIN_ADMIN_ID_RAW,))
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_status ON users(status)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)")
         conn.commit()
 
 # Ambil Daftar Kategori Gabungan
@@ -314,67 +542,155 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = update.effective_user.first_name if update.effective_user else "Pengguna"
     pesan = (
-        f"Halo <b>{user}</b>! Selamat datang di <b>Bot Catatan Keuangan Pribadi</b>. 💰\n\n"
-        "Gunakan <b>Tombol Menu</b> di bawah area ketik untuk memilih fitur dengan cepat!\n\n"
-        "<b>📌 Pilihan Menu:</b>\n"
+        f"Halo <b>{user}</b>! Selamat datang di <b>Bot Catatan Keuangan Pribadi (Google Sheets Synced)</b>. 💰📊\n\n"
+        "💡 <b>Pencatatan Otomatis & Auto-Sync:</b>\n"
+        "Anda bisa langsung mengetik pesan obrolan santai:\n"
+        "• <code>beli ayam 15k</code> ➡️ Tercatat di SQLite & Google Spreadsheet!\n"
+        "• <code>dapat uang 1jt</code> ➡️ Tercatat di SQLite & Google Spreadsheet!\n\n"
+        "<b>📌 Pilihan Menu Keyboard:</b>\n"
+        "• 🟢 <b>Sync Google Sheets</b> - Hubungkan & Sync massal ke Google Spreadsheet\n"
         "• 📥 <b>Tambah Pemasukan</b> - Catat uang masuk per kategori\n"
         "• 📤 <b>Tambah Pengeluaran</b> - Catat pengeluaran per kategori\n"
         "• 📊 <b>Rekap Keuangan</b> - Cek total saldo & rincian per kategori\n"
         "• 📈 <b>Grafik Visual</b> - Lihat grafik Pemasukan, Pengeluaran & Cashflow\n"
         "• 📋 <b>Riwayat Transaksi</b> - Edit & Hapus transaksi langsung\n"
         "• 🎯 <b>Set Budget</b> - Peringatan sisa anggaran bulanan\n"
-        "• ⚙️ <b>Pengaturan Saya</b> - Tambah/Hapus kategori kustom Anda\n"
+        "• ⚙️ <b>Admin & Kelola</b> - Tambah/Hapus kategori kustom Anda\n"
         "• 📑 <b>Export Laporan</b> - Unduh laporan Excel (CSV) & PDF\n"
-        "• 🛡️ <b>Admin Utama</b> - Kelola user dan backup database (khusus admin)"
+        "• 📦 <b>Backup DB</b> - Unduh file cadangan database"
     )
     await update.message.reply_text(
         pesan,
         parse_mode=ParseMode.HTML,
-        reply_markup=get_main_keyboard(update.effective_user.id)
+        reply_markup=get_main_keyboard()
     )
 
-# Helper Penangani Tombol Menu Utama
+# Helper Penangani Tombol Menu Utama & Perintah Fleksibel
 async def handle_if_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
     if not await is_authorized(update):
         return True
 
-    if text == "❌ Batal" or text == "/batal":
+    intent = match_flexible_command_intent(text)
+    if not intent:
+        return False
+
+    if intent == "batal":
         await batal(update, context)
         return True
-    elif text == "📊 Rekap Keuangan":
+    elif intent == "rekap":
         await rekap(update, context)
         return True
-    elif text in ["📈 Grafik Visual", "/grafik"]:
+    elif intent == "grafik":
         await prompt_grafik_menu(update, context)
         return True
-    elif text == "📋 Riwayat Transaksi":
+    elif intent == "riwayat":
         await riwayat(update, context)
         return True
-    elif text == "📥 Tambah Pemasukan":
+    elif intent == "prompt_pemasukan":
         await prompt_pemasukan(update, context)
         return True
-    elif text == "📤 Tambah Pengeluaran":
+    elif intent == "prompt_pengeluaran":
         await prompt_pengeluaran(update, context)
         return True
-    elif text == "🎯 Set Budget":
+    elif intent == "budget":
         await prompt_set_budget(update, context)
         return True
-    elif text in ["⚙️ Admin & Kelola", "⚙️ Pengaturan Saya"]:
+    elif intent == "admin":
         await admin_panel(update, context)
         return True
-    elif text == "🛡️ Admin Utama":
-        await main_admin_panel(update, context)
-        return True
-    elif text in ["📑 Export Laporan", "📊 Export CSV"]:
+    elif intent == "export":
         await prompt_export_menu(update, context)
         return True
-    elif text == "📦 Backup DB":
+    elif intent == "backup":
         await backup_db(update, context)
         return True
-    elif text in ["❓ Bantuan", "/help", "/bantuan", "/start"]:
+    elif intent == "sync_sheet":
+        await handle_google_sheet_sync(update, context)
+        return True
+    elif intent == "bantuan":
         await start(update, context)
         return True
+
     return False
+
+# Action Handler Sync Google Sheets
+async def handle_google_sheet_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_authorized(update):
+        return
+
+    msg_init = await update.message.reply_text("🔄 <i>Menghubungkan & Men-sync data ke Google Spreadsheet...</i>", parse_mode=ParseMode.HTML)
+    user_id = update.effective_user.id
+    success, message = sync_all_transactions_to_google_sheet(user_id)
+
+    if success:
+        sheet_url = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}" if GOOGLE_SHEET_ID else ""
+        resp_text = f"✅ <b>Google Sheets Sync Berhasil!</b> 📊\n\n{message}"
+        if sheet_url:
+            resp_text += f"\n\n🔗 <a href='{sheet_url}'>Buka Google Spreadsheet Anda</a>"
+        await msg_init.edit_text(resp_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    else:
+        info_setup = (
+            "❌ <b>Google Sheets Belum Terhubung!</b>\n\n"
+            f"<i>Penyebab:</i> {message}\n\n"
+            "💡 <b>Cara Menghubungkan Google Spreadsheet:</b>\n"
+            "1. Masukkan <code>GOOGLE_SHEET_ID</code> Anda di file <code>.env</code>\n"
+            "2. Taruh file <code>credentials.json</code> dari Google Cloud Service Account di folder bot."
+        )
+        await msg_init.edit_text(info_setup, parse_mode=ParseMode.HTML)
+
+# Penangani Pesan Chat Teks Alami (NLP Auto-Detect & Realtime Google Sheet Sync)
+async def handle_natural_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_authorized(update):
+        return
+
+    text = update.message.text.strip()
+
+    if await handle_if_menu_button(update, context, text):
+        return
+
+    res = extract_nominal_from_sentence(text)
+    if not res:
+        return
+
+    nominal, keterangan, original_text = res
+    user_id = update.effective_user.id
+    jenis, kategori = detect_jenis_and_kategori(original_text, user_id)
+    waktu_sekarang = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO transaksi (user_id, jenis, nominal, keterangan, tanggal, kategori) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, jenis, nominal, keterangan, waktu_sekarang, kategori)
+        )
+        tx_id = cursor.lastrowid
+        conn.commit()
+
+    # Real-Time Sync ke Google Sheets
+    synced = append_transaction_to_google_sheet(tx_id, jenis, nominal, kategori, keterangan, waktu_sekarang)
+    sync_status = "🟢 <i>Synced to Google Spreadsheet</i>" if synced else ""
+
+    emoji = "📥" if jenis == "Pemasukan" else "📤"
+    pesan_sukses = (
+        f"✅ <b>{jenis} Berhasil Dicatat Otomatis!</b> #{tx_id}\n\n"
+        f"{emoji} <b>Nominal:</b> {format_rupiah(nominal)}\n"
+        f"🏷️ <b>Kategori:</b> {kategori}\n"
+        f"📝 <b>Keterangan:</b> {keterangan}\n"
+        f"📅 <b>Waktu:</b> {waktu_sekarang}"
+    )
+    if sync_status:
+        pesan_sukses += f"\n{sync_status}"
+
+    if jenis == "Pengeluaran":
+        warning_msg = check_budget_warning(user_id)
+        if warning_msg:
+            pesan_sukses += f"\n\n{warning_msg}"
+
+    await update.message.reply_text(
+        pesan_sukses,
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_main_keyboard()
+    )
 
 # --- ALUR TAMBAH TRANSAKSI & PILIH KATEGORI ---
 def get_category_keyboard(user_id: int, jenis: str):
@@ -480,6 +796,9 @@ async def simpan_transaksi_input(update: Update, context: ContextTypes.DEFAULT_T
         tx_id = cursor.lastrowid
         conn.commit()
 
+    synced = append_transaction_to_google_sheet(tx_id, jenis, nominal, kategori, keterangan, waktu_sekarang)
+    sync_status = "🟢 <i>Synced to Google Spreadsheet</i>" if synced else ""
+
     emoji = "📥" if jenis == "Pemasukan" else "📤"
     pesan_sukses = (
         f"✅ <b>{jenis} Berhasil Dicatat!</b> #{tx_id}\n\n"
@@ -488,6 +807,8 @@ async def simpan_transaksi_input(update: Update, context: ContextTypes.DEFAULT_T
         f"📝 <b>Keterangan:</b> {keterangan}\n"
         f"📅 <b>Waktu:</b> {waktu_sekarang}"
     )
+    if sync_status:
+        pesan_sukses += f"\n{sync_status}"
 
     if jenis == "Pengeluaran":
         warning_msg = check_budget_warning(user_id)
@@ -662,7 +983,7 @@ async def rekap(update: Update, context: ContextTypes.DEFAULT_TYPE, period="this
             reply_markup=get_rekap_keyboard()
         )
 
-# --- FITUR GRAFIK VISUAL LENGKAP (PEMASUKAN, PENGELUARAN, CASHFLOW) ---
+# --- FITUR GRAFIK VISUAL LENGKAP ---
 def get_chart_menu_keyboard():
     keyboard = [
         [InlineKeyboardButton("📤 Grafik Pengeluaran", callback_data="do_chart_pengeluaran")],
@@ -719,7 +1040,7 @@ def generate_pie_chart(user_id: int, jenis: str = "Pengeluaran", period: str = "
     plt.close(fig)
     return filename, judul
 
-# Generator Bar Chart Cashflow (Pemasukan vs Pengeluaran)
+# Generator Bar Chart Cashflow
 def generate_cashflow_chart(user_id: int, period: str = "this_month", custom_ym: str = None):
     total_masuk, total_keluar, _, judul, _ = get_rekap_data(user_id, period, custom_ym)
 
@@ -966,7 +1287,10 @@ async def simpan_edit_nominal(update: Update, context: ContextTypes.DEFAULT_TYPE
         cursor.execute("UPDATE transaksi SET nominal = ? WHERE id = ? AND user_id = ?", (nominal, tx_id, user_id))
         conn.commit()
 
-    await update.message.reply_text(f"✅ Nominal transaksi #{tx_id} berhasil diubah ke <b>{format_rupiah(nominal)}</b>!", parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
+    # Sync Real-time ke Google Sheets
+    sync_all_transactions_to_google_sheet(user_id)
+
+    await update.message.reply_text(f"✅ Nominal transaksi #{tx_id} berhasil diubah ke <b>{format_rupiah(nominal)}</b> (Synced to Google Sheets)!", parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
     await riwayat(update, context, period=period, page=page)
     return ConversationHandler.END
 
@@ -1006,148 +1330,12 @@ async def simpan_edit_keterangan(update: Update, context: ContextTypes.DEFAULT_T
         cursor.execute("UPDATE transaksi SET keterangan = ? WHERE id = ? AND user_id = ?", (text, tx_id, user_id))
         conn.commit()
 
-    await update.message.reply_text(f"✅ Keterangan transaksi #{tx_id} berhasil diperbarui!", parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
+    # Sync Real-time ke Google Sheets
+    sync_all_transactions_to_google_sheet(user_id)
+
+    await update.message.reply_text(f"✅ Keterangan transaksi #{tx_id} berhasil diperbarui (Synced to Google Sheets)!", parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
     await riwayat(update, context, period=period, page=page)
     return ConversationHandler.END
-
-def get_admin_stats():
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM users")
-        total_users = cursor.fetchone()[0] or 0
-        cursor.execute("SELECT COUNT(*) FROM users WHERE status = 'active'")
-        active_users = cursor.fetchone()[0] or 0
-        cursor.execute("SELECT COUNT(*) FROM users WHERE status = 'blocked'")
-        blocked_users = cursor.fetchone()[0] or 0
-        cursor.execute("SELECT COUNT(*) FROM transaksi")
-        total_tx = cursor.fetchone()[0] or 0
-        cursor.execute(
-            "SELECT COUNT(*) FROM transaksi WHERE strftime('%Y-%m', tanggal) = strftime('%Y-%m', 'now', 'localtime')"
-        )
-        month_tx = cursor.fetchone()[0] or 0
-    return total_users, active_users, blocked_users, total_tx, month_tx
-
-def get_users_for_admin(limit: int = 20):
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT u.user_id, u.username, u.first_name, u.role, u.status, COUNT(t.id) AS tx_count
-            FROM users u
-            LEFT JOIN transaksi t ON t.user_id = u.user_id
-            GROUP BY u.user_id
-            ORDER BY u.last_seen_at DESC, u.created_at DESC
-            LIMIT ?
-            """,
-            (limit,),
-        )
-        return cursor.fetchall()
-
-def format_admin_user_label(user_id, username, first_name, role, status, tx_count) -> str:
-    name = f"@{username}" if username else (first_name or str(user_id))
-    return f"{name} | {role} | {status} | {tx_count} tx"
-
-async def main_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin_authorized(update):
-        return
-
-    total_users, active_users, blocked_users, total_tx, month_tx = get_admin_stats()
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("👥 Daftar User", callback_data="mainadmin_users")],
-        [InlineKeyboardButton("📊 Statistik Global", callback_data="mainadmin_stats")],
-    ])
-    pesan = (
-        "🛡️ <b>Admin Utama</b>\n\n"
-        f"👥 User: <b>{total_users}</b> total, <b>{active_users}</b> aktif, <b>{blocked_users}</b> diblokir\n"
-        f"📌 Transaksi: <b>{total_tx}</b> total, <b>{month_tx}</b> bulan ini\n\n"
-        "Gunakan panel ini untuk memantau user dan mengatur akses."
-    )
-
-    if update.callback_query:
-        await update.callback_query.edit_message_text(pesan, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-    else:
-        await update.message.reply_text(pesan, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-
-async def admin_users_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin_authorized(update):
-        return
-
-    query = update.callback_query
-    rows = get_users_for_admin()
-    if not rows:
-        msg = "👥 <b>Daftar User</b>\n\nBelum ada user terdaftar."
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Kembali", callback_data="mainadmin_back")]])
-    else:
-        msg = "👥 <b>Daftar User Terbaru</b>\n\n"
-        buttons = []
-        for user_id, username, first_name, role, status, tx_count in rows:
-            msg += f"• <code>{user_id}</code> - {format_admin_user_label(user_id, username, first_name, role, status, tx_count)}\n"
-            if role != "admin":
-                action = "unblockuser" if status == "blocked" else "blockuser"
-                label = "✅ Aktifkan" if status == "blocked" else "🚫 Blokir"
-                buttons.append([InlineKeyboardButton(f"{label} {username or first_name or user_id}", callback_data=f"{action}_{user_id}")])
-        buttons.append([InlineKeyboardButton("🔙 Kembali", callback_data="mainadmin_back")])
-        keyboard = InlineKeyboardMarkup(buttons)
-
-    if query:
-        await query.edit_message_text(msg, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-    else:
-        await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-
-async def admin_stats_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin_authorized(update):
-        return
-
-    total_users, active_users, blocked_users, total_tx, month_tx = get_admin_stats()
-    msg = (
-        "📊 <b>Statistik Global</b>\n\n"
-        f"👥 Total user: <b>{total_users}</b>\n"
-        f"✅ User aktif: <b>{active_users}</b>\n"
-        f"🚫 User diblokir: <b>{blocked_users}</b>\n"
-        f"📌 Total transaksi: <b>{total_tx}</b>\n"
-        f"🗓️ Transaksi bulan ini: <b>{month_tx}</b>"
-    )
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Kembali", callback_data="mainadmin_back")]])
-
-    if update.callback_query:
-        await update.callback_query.edit_message_text(msg, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-    else:
-        await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-
-async def set_user_status(update: Update, context: ContextTypes.DEFAULT_TYPE, target_user_id: int, status: str):
-    if not await is_admin_authorized(update):
-        return
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE users SET status = ? WHERE user_id = ? AND role != 'admin'", (status, target_user_id))
-        conn.commit()
-    if update.callback_query:
-        await update.callback_query.answer(f"Status user {target_user_id} diubah menjadi {status}.", show_alert=True)
-        await admin_users_panel(update, context)
-    else:
-        await update.message.reply_text(f"✅ Status user <code>{target_user_id}</code> diubah menjadi <b>{status}</b>.", parse_mode=ParseMode.HTML)
-
-async def block_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Format: /block <user_id>")
-        return
-    try:
-        target_user_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("User ID harus berupa angka. Format: /block <user_id>")
-        return
-    await set_user_status(update, context, target_user_id, "blocked")
-
-async def unblock_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Format: /unblock <user_id>")
-        return
-    try:
-        target_user_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("User ID harus berupa angka. Format: /unblock <user_id>")
-        return
-    await set_user_status(update, context, target_user_id, "active")
 
 # --- FITUR ADMIN / KELOLA KATEGORI ---
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1161,7 +1349,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
 
     pesan = (
-        "⚙️ <b>Pengaturan Saya</b>\n\n"
+        "⚙️ <b>Panel Admin & Kelola Kategori</b>\n\n"
         "Anda dapat menambah atau menghapus kategori transaksi Anda sendiri tanpa perlu menyentuh kodingan!"
     )
     
@@ -1371,17 +1559,17 @@ async def export_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.remove(filename)
 
 async def backup_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin_authorized(update):
+    if not await is_authorized(update):
         return
 
     if not os.path.exists(DB_NAME):
-        await update.effective_message.reply_text("❌ File database belum ditemukan.")
+        await update.message.reply_text("❌ File database belum ditemukan.")
         return
 
-    await update.effective_message.reply_document(
+    await update.message.reply_document(
         document=open(DB_NAME, "rb"),
         filename="keuangan_backup.db",
-        caption="📦 <b>Backup Database Keuangan</b>\n\nFile ini berisi data semua user. Simpan file ini dengan aman!",
+        caption="📦 <b>Backup Database Keuangan</b>\n\nFile ini adalah cadangan database Anda. Simpan file ini dengan aman!",
         parse_mode=ParseMode.HTML
     )
 
@@ -1493,29 +1681,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         return
 
-    elif data == "mainadmin_back":
-        await query.answer()
-        await main_admin_panel(update, context)
-    elif data == "mainadmin_users":
-        await query.answer()
-        await admin_users_panel(update, context)
-    elif data == "mainadmin_stats":
-        await query.answer()
-        await admin_stats_panel(update, context)
-    elif data.startswith("blockuser_"):
-        target_user_id = int(data.split("_")[1])
-        await set_user_status(update, context, target_user_id, "blocked")
-    elif data.startswith("unblockuser_"):
-        target_user_id = int(data.split("_")[1])
-        await set_user_status(update, context, target_user_id, "active")
-
-    # Export Handlers
     elif data == "do_export_csv":
         await export_csv(update, context)
     elif data == "do_export_pdf":
         await export_pdf(update, context)
 
-    # Show Grafik Handlers
     elif data == "chart_menu_prompt":
         await prompt_grafik_menu(update, context)
     elif data == "do_chart_pengeluaran":
@@ -1525,7 +1695,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "do_chart_cashflow":
         await kirim_grafik_cashflow(update, context)
 
-    # Filter Rekap
     elif data == "rekap_today":
         await query.answer()
         await rekap(update, context, period="today")
@@ -1536,7 +1705,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         await rekap(update, context, period="all")
 
-    # Filter Riwayat & Pagination
     elif data.startswith("rw_"):
         await query.answer()
         parts = data.split("_")
@@ -1544,7 +1712,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         page = int(parts[2]) if len(parts) > 2 else 1
         await riwayat(update, context, period=period, page=page)
 
-    # Menu Opsi Edit Transaksi (#tx_id)
     elif data.startswith("editopt_"):
         await query.answer()
         parts = data.split("_")
@@ -1582,7 +1749,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         await query.edit_message_text(text_menu, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
-    # Ganti Kategori Langsung dari Tombol Inline
     elif data.startswith("setcat_"):
         await query.answer()
         parts = data.split("_")
@@ -1604,10 +1770,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cursor.execute("UPDATE transaksi SET kategori = ? WHERE id = ? AND user_id = ?", (new_cat, tx_id, user_id))
                 conn.commit()
 
+        # Sync Real-time ke Google Sheets saat Kategori Diubah
+        sync_all_transactions_to_google_sheet(user_id)
+
         await query.answer(f"✅ Kategori diubah ke {new_cat}!", show_alert=True)
         await riwayat(update, context, period=period, page=page)
 
-    # Menu Pilih Kategori Baru untuk Transaksi #tx_id
     elif data.startswith("doedit_catmenu_"):
         await query.answer()
         tx_id = int(data.split("_")[2])
@@ -1639,7 +1807,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup(buttons)
             )
 
-    # Konfirmasi Hapus Transaksi
     elif data.startswith("askdel_"):
         await query.answer()
         parts = data.split("_")
@@ -1675,7 +1842,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         await query.edit_message_text(confirm_text, parse_mode=ParseMode.HTML, reply_markup=confirm_keyboard)
 
-    # Eksekusi Hapus Transaksi
     elif data.startswith("confirmdel_"):
         parts = data.split("_")
         tx_id = int(parts[1])
@@ -1687,10 +1853,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cursor.execute("DELETE FROM transaksi WHERE id = ? AND user_id = ?", (tx_id, user_id))
             conn.commit()
 
-        await query.answer(f"✅ Transaksi #{tx_id} berhasil dihapus!", show_alert=True)
+        # Sync Real-time ke Google Sheets saat Transaksi Dihapus!
+        sync_all_transactions_to_google_sheet(user_id)
+
+        await query.answer(f"✅ Transaksi #{tx_id} berhasil dihapus & ter-update di Google Sheets!", show_alert=True)
         await riwayat(update, context, period=period, page=page)
 
-    # --- CALLBACK ADMIN PANEL ---
     elif data == "admin_add_cat":
         await query.answer()
         keyboard = InlineKeyboardMarkup([
@@ -1749,7 +1917,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_daily_reminder(context: ContextTypes.DEFAULT_TYPE):
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT user_id FROM users WHERE status = 'active'")
+        cursor.execute("SELECT DISTINCT user_id FROM transaksi")
         user_ids = [row[0] for row in cursor.fetchall()]
 
     for uid in user_ids:
@@ -1759,7 +1927,7 @@ async def send_daily_reminder(context: ContextTypes.DEFAULT_TYPE):
                 text=(
                     "🔔 <b>Pengingat Catat Keuangan</b>\n\n"
                     "Halo! Sudahkah Anda mencatat pengeluaran & pemasukan Anda hari ini? 😉\n\n"
-                    "Tekan <b>📥 Tambah Pemasukan</b> atau <b>📤 Tambah Pengeluaran</b> di bawah untuk mencatat."
+                    "Cukup ketik obrolan seperti <code>beli ayam 15k</code> atau <code>dapat uang 500k</code>!"
                 ),
                 parse_mode=ParseMode.HTML,
                 reply_markup=get_main_keyboard()
@@ -1771,7 +1939,6 @@ if __name__ == "__main__":
     init_db()
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # ConversationHandler Alur Transaksi, Custom Date, Budget, Edit & Admin
     conv_handler = ConversationHandler(
         entry_points=[
             MessageHandler(filters.Regex("^📥 Tambah Pemasukan$"), prompt_pemasukan),
@@ -1811,33 +1978,26 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("grafik", prompt_grafik_menu))
     app.add_handler(CommandHandler("riwayat", riwayat))
     app.add_handler(CommandHandler("export", prompt_export_menu))
+    app.add_handler(CommandHandler("sync", handle_google_sheet_sync))
     app.add_handler(CommandHandler("backup", backup_db))
-    app.add_handler(CommandHandler("admin", main_admin_panel))
-    app.add_handler(CommandHandler("users", admin_users_panel))
-    app.add_handler(CommandHandler("stats", admin_stats_panel))
-    app.add_handler(CommandHandler("block", block_user_command))
-    app.add_handler(CommandHandler("unblock", unblock_user_command))
     
-    # Text Message Handlers untuk Menu Keyboard Utama
     app.add_handler(MessageHandler(filters.Regex("^📊 Rekap Keuangan$"), rekap))
     app.add_handler(MessageHandler(filters.Regex("^📈 Grafik Visual$"), prompt_grafik_menu))
     app.add_handler(MessageHandler(filters.Regex("^📋 Riwayat Transaksi$"), riwayat))
     app.add_handler(MessageHandler(filters.Regex("^🎯 Set Budget$"), prompt_set_budget))
+    app.add_handler(MessageHandler(filters.Regex("^🟢 Sync Google Sheets$"), handle_google_sheet_sync))
     app.add_handler(MessageHandler(filters.Regex("^⚙️ Admin & Kelola$"), admin_panel))
-    app.add_handler(MessageHandler(filters.Regex("^⚙️ Pengaturan Saya$"), admin_panel))
-    app.add_handler(MessageHandler(filters.Regex("^🛡️ Admin Utama$"), main_admin_panel))
     app.add_handler(MessageHandler(filters.Regex("^📑 Export Laporan$"), prompt_export_menu))
     app.add_handler(MessageHandler(filters.Regex("^📊 Export CSV$"), prompt_export_menu))
     app.add_handler(MessageHandler(filters.Regex("^📦 Backup DB$"), backup_db))
     app.add_handler(MessageHandler(filters.Regex("^❓ Bantuan$"), start))
     app.add_handler(MessageHandler(filters.Regex("^❌ Batal$"), batal))
 
-    # Callback Query Handler Umum
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_natural_text_message))
     app.add_handler(CallbackQueryHandler(button_callback))
 
-    # Jadwal Pengingat Harian (Setiap jam 20:00 WIB)
     if app.job_queue:
         app.job_queue.run_daily(send_daily_reminder, time=time(hour=20, minute=0, second=0))
 
-    print("🚀 Bot Keuangan Multi-User sedang berjalan...")
+    print("🚀 Bot Keuangan Pribadi (REALTIME SYNC HAPUS/EDIT TERPASANG) sedang berjalan...")
     app.run_polling()
