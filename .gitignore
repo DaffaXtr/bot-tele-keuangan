@@ -1,0 +1,25 @@
+# Environment variables (Sangat Rahasia - Berisi Token & Telegram User ID)
+.env
+
+# Database SQLite (Cadangan Data Keuangan Pribadi)
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary Output Files (PDF, CSV, PNG)
+*.png
+*.pdf
+*.csv
+
+# Python Cache & Environment
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+ENV/
+.venv
+
+# IDE Config
+.vscode/
+.idea/
