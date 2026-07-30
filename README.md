@@ -1,6 +1,6 @@
 # 💰 Bot Catatan Keuangan Pribadi (Telegram Bot)
 
-Bot Telegram pintar, interaktif, dan fleksibel yang dirancang untuk membantu pengelolaan keuangan pribadi harian secara serba otomatis, cepat, dan nyaman.
+Bot Telegram pintar, interaktif, dan fleksibel yang dirancang untuk membantu pengelolaan keuangan pribadi harian secara serba otomatis, cepat, dan nyaman. Bot ini mendukung banyak pengguna dengan data yang dipisahkan berdasarkan akun Telegram masing-masing.
 
 ![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Telegram Bot API](https://img.shields.io/badge/Telegram%20Bot%20API-v20%2B-blue)
@@ -39,15 +39,18 @@ Bot Telegram pintar, interaktif, dan fleksibel yang dirancang untuk membantu pen
 - **🎯 Pengaturan Budget Bulanan**
   Fitur peringatan otomatis saat pengeluaran telah mencapai **80%** atau **melebihi (100%)** dari target budget bulanan yang diset.
 
-- **⚙️ Panel Admin & Kelola Kategori Kustom**
+- **⚙️ Pengaturan Saya & Kategori Kustom**
   Bebas menambah atau menghapus kategori pemasukan & pengeluaran dari Telegram tanpa perlu mengubah kodingan.
+
+- **🛡️ Admin Utama Multi-User**
+  Admin utama (`dapxtr`) dapat melihat statistik global, daftar user, serta memblokir atau mengaktifkan user.
 
 - **📑 Export Laporan PDF & CSV (Excel)**
   - **📄 PDF Report:** Dokumen rapi berisi ringkasan saldo dan tabel rincian transaksi lengkap dengan kolom Nomor Urut (`No.`).
   - **📊 CSV File:** Format spreadsheet yang siap dibuka di Microsoft Excel / Google Sheets.
 
-- **📦 Backup Database Instan**
-  Unduh cadangan database `keuangan.db` secara langsung kapan saja.
+- **📦 Backup Database Instan Khusus Admin**
+  Admin utama dapat mengunduh cadangan database `keuangan.db` yang berisi data semua user.
 
 - **🔔 Pengingat Harian (Daily Reminder)**
   Pengingat otomatis harian setiap jam 20:00 WIB untuk mencatat pengeluaran.
@@ -76,14 +79,18 @@ pip install python-telegram-bot fpdf2 matplotlib
 ```
 
 ### 3. Mengatur Token Telegram Bot
-Anda bisa menggunakan Token default yang ada atau menyetel *environment variable*:
+Anda bisa menggunakan file `.env` atau menyetel *environment variable*:
 ```bash
 # Windows (PowerShell)
 $env:TELEGRAM_BOT_TOKEN="TOKEN_BOT_ANDA"
+$env:MAIN_ADMIN_USERNAME="dapxtr"
 
 # Linux / macOS
 export TELEGRAM_BOT_TOKEN="TOKEN_BOT_ANDA"
+export MAIN_ADMIN_USERNAME="dapxtr"
 ```
+
+Jika sudah tahu numeric Telegram ID admin, isi juga `MAIN_ADMIN_ID` agar admin tetap dikenali walaupun username berubah.
 
 ### 4. Menjalankan Bot
 Jalankan bot dengan perintah:

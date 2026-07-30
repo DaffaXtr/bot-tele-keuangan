@@ -49,9 +49,10 @@ logging.basicConfig(
     ADD_CAT_NAME_STATE,
 ) = range(1, 8)
 
-# Token Bot Telegram & Authorization Whitelist (Mendukung ID Angka mau pun Username)
+# Token Bot Telegram & Konfigurasi Admin Utama
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-ALLOWED_USER_ID_RAW = os.getenv("ALLOWED_USER_ID", "").strip()
+MAIN_ADMIN_USERNAME = os.getenv("MAIN_ADMIN_USERNAME", "dapxtr").strip().lstrip("@").lower()
+MAIN_ADMIN_ID_RAW = os.getenv("MAIN_ADMIN_ID", "").strip()
 
 if not TOKEN:
     print("❌ ERROR: TELEGRAM_BOT_TOKEN tidak ditemukan di berkas .env! Silakan isi TELEGRAM_BOT_TOKEN Anda.")
@@ -64,34 +65,82 @@ PER_PAGE = 5  # Item per halaman di riwayat
 DEFAULT_PENGELUARAN_KATEGORI = ["🍔 Makanan", "🚗 Transportasi", "🛍️ Belanja", "🏠 Tagihan", "🎬 Hiburan", "💊 Kesehatan", "📦 Lainnya"]
 DEFAULT_PEMASUKAN_KATEGORI = ["💼 Gaji", "🎁 Bonus", "📈 Investasi", "💵 Usaha", "📦 Lainnya"]
 
-# Middleware Pengecekan Otorisasi Pengguna (Mendukung Username 'dapxtr' / '@dapxtr' mau pun ID Angka)
-async def is_authorized(update: Update) -> bool:
-    if not ALLOWED_USER_ID_RAW:
-        return True  # Jika ALLOWED_USER_ID kosong, bot terbuka untuk siapa saja
+def is_main_admin_user(user) -> bool:
+    if not user:
+        return False
+    if MAIN_ADMIN_ID_RAW and str(user.id) == MAIN_ADMIN_ID_RAW:
+        return True
+    return bool(MAIN_ADMIN_USERNAME and user.username and user.username.lower() == MAIN_ADMIN_USERNAME)
 
+def upsert_user(user) -> None:
+    if not user:
+        return
+    role = "admin" if is_main_admin_user(user) else "user"
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO users (user_id, username, first_name, last_name, role, status, created_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                first_name = excluded.first_name,
+                last_name = excluded.last_name,
+                role = CASE WHEN excluded.role = 'admin' THEN 'admin' ELSE users.role END,
+                last_seen_at = CURRENT_TIMESTAMP
+            """,
+            (user.id, user.username, user.first_name, user.last_name, role),
+        )
+        conn.commit()
+
+def get_user_status(user_id: int) -> str:
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT status FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+    return row[0] if row else "active"
+
+def get_user_role(user_id: int) -> str:
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT role FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+    return row[0] if row else "user"
+
+def is_admin_id(user_id: int) -> bool:
+    return get_user_role(user_id) == "admin"
+
+# Middleware otorisasi multi-user: semua user aktif boleh memakai bot.
+async def is_authorized(update: Update) -> bool:
     user = update.effective_user
     if not user:
         return False
 
-    target = ALLOWED_USER_ID_RAW.lstrip("@").lower()
+    upsert_user(user)
+    if get_user_status(user.id) != "active":
+        msg = (
+            "🔒 <b>Akses Ditolak!</b>\n\n"
+            "Akun Anda sedang diblokir oleh admin utama."
+        )
+        if update.callback_query:
+            await update.callback_query.answer("🔒 Akun diblokir.", show_alert=True)
+        elif update.message:
+            await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+        return False
+    return True
 
-    # 1. Cek kecocokan Username Telegram (misal: dapxtr)
-    if user.username and user.username.lower() == target:
+async def is_admin_authorized(update: Update) -> bool:
+    if not await is_authorized(update):
+        return False
+    user = update.effective_user
+    if user and is_admin_id(user.id):
         return True
 
-    # 2. Cek kecocokan ID Angka Telegram (misal: 123456789)
-    if str(user.id) == target:
-        return True
-
-    # Jika tidak cocok dengan keduanya, tolak akses
-    msg = (
-        "🔒 <b>Akses Ditolak!</b>\n\n"
-        "Maaf, bot keuangan ini telah diproteksi khusus untuk penggunaan pribadi pemiliknya."
-    )
+    msg = "🔒 Fitur ini hanya untuk admin utama."
     if update.callback_query:
-        await update.callback_query.answer("🔒 Akses Ditolak!", show_alert=True)
+        await update.callback_query.answer(msg, show_alert=True)
     elif update.message:
-        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+        await update.message.reply_text(msg)
     return False
 
 # Helper Pembersih Emoji untuk Label Matplotlib (Menghindari Karakter Kotak [?])
@@ -114,15 +163,17 @@ class PDFReport(FPDF):
         self.cell(0, 10, f"Halaman {self.page_no()}/{{nb}}", align="C")
 
 # Keyboard Utama
-def get_main_keyboard():
+def get_main_keyboard(user_id: int = None):
     keyboard = [
         [KeyboardButton("📊 Rekap Keuangan"), KeyboardButton("📈 Grafik Visual")],
         [KeyboardButton("📋 Riwayat Transaksi"), KeyboardButton("🎯 Set Budget")],
         [KeyboardButton("📥 Tambah Pemasukan"), KeyboardButton("📤 Tambah Pengeluaran")],
-        [KeyboardButton("📑 Export Laporan"), KeyboardButton("⚙️ Admin & Kelola")],
-        [KeyboardButton("📦 Backup DB"), KeyboardButton("❓ Bantuan")],
+        [KeyboardButton("📑 Export Laporan"), KeyboardButton("⚙️ Pengaturan Saya")],
+        [KeyboardButton("❓ Bantuan")],
         [KeyboardButton("❌ Batal")]
     ]
+    if user_id and is_admin_id(user_id):
+        keyboard.insert(-2, [KeyboardButton("🛡️ Admin Utama"), KeyboardButton("📦 Backup DB")])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 # Format Angka ke Rupiah Indonesia
@@ -196,6 +247,19 @@ def init_db():
             )
         """)
 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                role TEXT DEFAULT 'user',
+                status TEXT DEFAULT 'active',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at TIMESTAMP
+            )
+        """)
+
         cursor.execute("PRAGMA table_info(transaksi)")
         columns = [column[1] for column in cursor.fetchall()]
         if "kategori" not in columns:
@@ -220,6 +284,18 @@ def init_db():
                 nama_kategori TEXT
             )
         """)
+
+        cursor.execute("""
+            INSERT OR IGNORE INTO users (user_id, role, status, created_at)
+            SELECT DISTINCT user_id,
+                   CASE WHEN CAST(user_id AS TEXT) = ? THEN 'admin' ELSE 'user' END,
+                   'active',
+                   CURRENT_TIMESTAMP
+            FROM transaksi
+            WHERE user_id IS NOT NULL
+        """, (MAIN_ADMIN_ID_RAW,))
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_status ON users(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)")
         conn.commit()
 
 # Ambil Daftar Kategori Gabungan
@@ -247,14 +323,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 📈 <b>Grafik Visual</b> - Lihat grafik Pemasukan, Pengeluaran & Cashflow\n"
         "• 📋 <b>Riwayat Transaksi</b> - Edit & Hapus transaksi langsung\n"
         "• 🎯 <b>Set Budget</b> - Peringatan sisa anggaran bulanan\n"
-        "• ⚙️ <b>Admin & Kelola</b> - Tambah/Hapus kategori kustom Anda\n"
+        "• ⚙️ <b>Pengaturan Saya</b> - Tambah/Hapus kategori kustom Anda\n"
         "• 📑 <b>Export Laporan</b> - Unduh laporan Excel (CSV) & PDF\n"
-        "• 📦 <b>Backup DB</b> - Unduh file cadangan database"
+        "• 🛡️ <b>Admin Utama</b> - Kelola user dan backup database (khusus admin)"
     )
     await update.message.reply_text(
         pesan,
         parse_mode=ParseMode.HTML,
-        reply_markup=get_main_keyboard()
+        reply_markup=get_main_keyboard(update.effective_user.id)
     )
 
 # Helper Penangani Tombol Menu Utama
@@ -283,8 +359,11 @@ async def handle_if_menu_button(update: Update, context: ContextTypes.DEFAULT_TY
     elif text == "🎯 Set Budget":
         await prompt_set_budget(update, context)
         return True
-    elif text == "⚙️ Admin & Kelola":
+    elif text in ["⚙️ Admin & Kelola", "⚙️ Pengaturan Saya"]:
         await admin_panel(update, context)
+        return True
+    elif text == "🛡️ Admin Utama":
+        await main_admin_panel(update, context)
         return True
     elif text in ["📑 Export Laporan", "📊 Export CSV"]:
         await prompt_export_menu(update, context)
@@ -931,6 +1010,145 @@ async def simpan_edit_keterangan(update: Update, context: ContextTypes.DEFAULT_T
     await riwayat(update, context, period=period, page=page)
     return ConversationHandler.END
 
+def get_admin_stats():
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM users")
+        total_users = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT COUNT(*) FROM users WHERE status = 'active'")
+        active_users = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT COUNT(*) FROM users WHERE status = 'blocked'")
+        blocked_users = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT COUNT(*) FROM transaksi")
+        total_tx = cursor.fetchone()[0] or 0
+        cursor.execute(
+            "SELECT COUNT(*) FROM transaksi WHERE strftime('%Y-%m', tanggal) = strftime('%Y-%m', 'now', 'localtime')"
+        )
+        month_tx = cursor.fetchone()[0] or 0
+    return total_users, active_users, blocked_users, total_tx, month_tx
+
+def get_users_for_admin(limit: int = 20):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT u.user_id, u.username, u.first_name, u.role, u.status, COUNT(t.id) AS tx_count
+            FROM users u
+            LEFT JOIN transaksi t ON t.user_id = u.user_id
+            GROUP BY u.user_id
+            ORDER BY u.last_seen_at DESC, u.created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return cursor.fetchall()
+
+def format_admin_user_label(user_id, username, first_name, role, status, tx_count) -> str:
+    name = f"@{username}" if username else (first_name or str(user_id))
+    return f"{name} | {role} | {status} | {tx_count} tx"
+
+async def main_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin_authorized(update):
+        return
+
+    total_users, active_users, blocked_users, total_tx, month_tx = get_admin_stats()
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 Daftar User", callback_data="mainadmin_users")],
+        [InlineKeyboardButton("📊 Statistik Global", callback_data="mainadmin_stats")],
+    ])
+    pesan = (
+        "🛡️ <b>Admin Utama</b>\n\n"
+        f"👥 User: <b>{total_users}</b> total, <b>{active_users}</b> aktif, <b>{blocked_users}</b> diblokir\n"
+        f"📌 Transaksi: <b>{total_tx}</b> total, <b>{month_tx}</b> bulan ini\n\n"
+        "Gunakan panel ini untuk memantau user dan mengatur akses."
+    )
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(pesan, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    else:
+        await update.message.reply_text(pesan, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+async def admin_users_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin_authorized(update):
+        return
+
+    query = update.callback_query
+    rows = get_users_for_admin()
+    if not rows:
+        msg = "👥 <b>Daftar User</b>\n\nBelum ada user terdaftar."
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Kembali", callback_data="mainadmin_back")]])
+    else:
+        msg = "👥 <b>Daftar User Terbaru</b>\n\n"
+        buttons = []
+        for user_id, username, first_name, role, status, tx_count in rows:
+            msg += f"• <code>{user_id}</code> - {format_admin_user_label(user_id, username, first_name, role, status, tx_count)}\n"
+            if role != "admin":
+                action = "unblockuser" if status == "blocked" else "blockuser"
+                label = "✅ Aktifkan" if status == "blocked" else "🚫 Blokir"
+                buttons.append([InlineKeyboardButton(f"{label} {username or first_name or user_id}", callback_data=f"{action}_{user_id}")])
+        buttons.append([InlineKeyboardButton("🔙 Kembali", callback_data="mainadmin_back")])
+        keyboard = InlineKeyboardMarkup(buttons)
+
+    if query:
+        await query.edit_message_text(msg, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    else:
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+async def admin_stats_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin_authorized(update):
+        return
+
+    total_users, active_users, blocked_users, total_tx, month_tx = get_admin_stats()
+    msg = (
+        "📊 <b>Statistik Global</b>\n\n"
+        f"👥 Total user: <b>{total_users}</b>\n"
+        f"✅ User aktif: <b>{active_users}</b>\n"
+        f"🚫 User diblokir: <b>{blocked_users}</b>\n"
+        f"📌 Total transaksi: <b>{total_tx}</b>\n"
+        f"🗓️ Transaksi bulan ini: <b>{month_tx}</b>"
+    )
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Kembali", callback_data="mainadmin_back")]])
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(msg, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    else:
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+async def set_user_status(update: Update, context: ContextTypes.DEFAULT_TYPE, target_user_id: int, status: str):
+    if not await is_admin_authorized(update):
+        return
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET status = ? WHERE user_id = ? AND role != 'admin'", (status, target_user_id))
+        conn.commit()
+    if update.callback_query:
+        await update.callback_query.answer(f"Status user {target_user_id} diubah menjadi {status}.", show_alert=True)
+        await admin_users_panel(update, context)
+    else:
+        await update.message.reply_text(f"✅ Status user <code>{target_user_id}</code> diubah menjadi <b>{status}</b>.", parse_mode=ParseMode.HTML)
+
+async def block_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Format: /block <user_id>")
+        return
+    try:
+        target_user_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("User ID harus berupa angka. Format: /block <user_id>")
+        return
+    await set_user_status(update, context, target_user_id, "blocked")
+
+async def unblock_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Format: /unblock <user_id>")
+        return
+    try:
+        target_user_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("User ID harus berupa angka. Format: /unblock <user_id>")
+        return
+    await set_user_status(update, context, target_user_id, "active")
+
 # --- FITUR ADMIN / KELOLA KATEGORI ---
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_authorized(update):
@@ -943,7 +1161,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
 
     pesan = (
-        "⚙️ <b>Panel Admin & Kelola Kategori</b>\n\n"
+        "⚙️ <b>Pengaturan Saya</b>\n\n"
         "Anda dapat menambah atau menghapus kategori transaksi Anda sendiri tanpa perlu menyentuh kodingan!"
     )
     
@@ -1153,17 +1371,17 @@ async def export_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.remove(filename)
 
 async def backup_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_authorized(update):
+    if not await is_admin_authorized(update):
         return
 
     if not os.path.exists(DB_NAME):
-        await update.message.reply_text("❌ File database belum ditemukan.")
+        await update.effective_message.reply_text("❌ File database belum ditemukan.")
         return
 
-    await update.message.reply_document(
+    await update.effective_message.reply_document(
         document=open(DB_NAME, "rb"),
         filename="keuangan_backup.db",
-        caption="📦 <b>Backup Database Keuangan</b>\n\nFile ini adalah cadangan database Anda. Simpan file ini dengan aman!",
+        caption="📦 <b>Backup Database Keuangan</b>\n\nFile ini berisi data semua user. Simpan file ini dengan aman!",
         parse_mode=ParseMode.HTML
     )
 
@@ -1274,6 +1492,22 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "noop":
         await query.answer()
         return
+
+    elif data == "mainadmin_back":
+        await query.answer()
+        await main_admin_panel(update, context)
+    elif data == "mainadmin_users":
+        await query.answer()
+        await admin_users_panel(update, context)
+    elif data == "mainadmin_stats":
+        await query.answer()
+        await admin_stats_panel(update, context)
+    elif data.startswith("blockuser_"):
+        target_user_id = int(data.split("_")[1])
+        await set_user_status(update, context, target_user_id, "blocked")
+    elif data.startswith("unblockuser_"):
+        target_user_id = int(data.split("_")[1])
+        await set_user_status(update, context, target_user_id, "active")
 
     # Export Handlers
     elif data == "do_export_csv":
@@ -1515,7 +1749,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_daily_reminder(context: ContextTypes.DEFAULT_TYPE):
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT DISTINCT user_id FROM transaksi")
+        cursor.execute("SELECT user_id FROM users WHERE status = 'active'")
         user_ids = [row[0] for row in cursor.fetchall()]
 
     for uid in user_ids:
@@ -1578,6 +1812,11 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("riwayat", riwayat))
     app.add_handler(CommandHandler("export", prompt_export_menu))
     app.add_handler(CommandHandler("backup", backup_db))
+    app.add_handler(CommandHandler("admin", main_admin_panel))
+    app.add_handler(CommandHandler("users", admin_users_panel))
+    app.add_handler(CommandHandler("stats", admin_stats_panel))
+    app.add_handler(CommandHandler("block", block_user_command))
+    app.add_handler(CommandHandler("unblock", unblock_user_command))
     
     # Text Message Handlers untuk Menu Keyboard Utama
     app.add_handler(MessageHandler(filters.Regex("^📊 Rekap Keuangan$"), rekap))
@@ -1585,6 +1824,8 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.Regex("^📋 Riwayat Transaksi$"), riwayat))
     app.add_handler(MessageHandler(filters.Regex("^🎯 Set Budget$"), prompt_set_budget))
     app.add_handler(MessageHandler(filters.Regex("^⚙️ Admin & Kelola$"), admin_panel))
+    app.add_handler(MessageHandler(filters.Regex("^⚙️ Pengaturan Saya$"), admin_panel))
+    app.add_handler(MessageHandler(filters.Regex("^🛡️ Admin Utama$"), main_admin_panel))
     app.add_handler(MessageHandler(filters.Regex("^📑 Export Laporan$"), prompt_export_menu))
     app.add_handler(MessageHandler(filters.Regex("^📊 Export CSV$"), prompt_export_menu))
     app.add_handler(MessageHandler(filters.Regex("^📦 Backup DB$"), backup_db))
@@ -1598,5 +1839,5 @@ if __name__ == "__main__":
     if app.job_queue:
         app.job_queue.run_daily(send_daily_reminder, time=time(hour=20, minute=0, second=0))
 
-    print("🚀 Bot Keuangan Pribadi (DUKUNGAN USERNAME 'dapxtr' TERPASANG) sedang berjalan...")
+    print("🚀 Bot Keuangan Multi-User sedang berjalan...")
     app.run_polling()
