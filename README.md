@@ -25,7 +25,7 @@ Bot Telegram pintar, interaktif, dan fleksibel yang dirancang untuk membantu pen
   Ringkasan total pemasukan, pengeluaran, serta sisa saldo dengan opsi filter waktu:
   - 📅 Hari Ini
   - 🗓️ Bulan Ini
-  - 📆 Filter Custom Bulan/Tahun (`MM-YYYY`)
+  - 📆 Filter Custom Bulan/Tahun (`MM-YYYY`) atau Tanggal Spesifik (`DD-MM-YYYY`)
   - ♾️ Semua Waktu
 
 - **📈 Visualisasi Grafik Visual (Matplotlib)**
@@ -33,24 +33,18 @@ Bot Telegram pintar, interaktif, dan fleksibel yang dirancang untuk membantu pen
   - **📥 Pie Chart Pemasukan:** Persentase alokasi sumber uang masuk.
   - **📊 Bar Chart Cashflow:** Grafik batang perbandingan Total Pemasukan vs Total Pengeluaran.
 
-- **📋 Riwayat Transaksi & Pagination**
-  Menampilkan riwayat transaksi per halaman (5 item/halaman) dilengkapi tombol **✏️ Edit Nominal/Kategori/Keterangan** dan **🗑️ Hapus** interaktif.
+- **📋 Riwayat Transaksi & Filter Tanggal Manual**
+  Menampilkan riwayat transaksi per halaman (5 item/halaman) dilengkapi tombol **✏️ Edit Nominal/Kategori/Keterangan**, **🗑️ Hapus**, serta tombol **📆 Set Tanggal Manual** (`DD-MM-YYYY` / `MM-YYYY`).
 
 - **🎯 Pengaturan Budget Bulanan**
   Fitur peringatan otomatis saat pengeluaran telah mencapai **80%** atau **melebihi (100%)** dari target budget bulanan yang diset.
 
-- **⚙️ Pengaturan Saya & Kategori Kustom**
-  Bebas menambah atau menghapus kategori pemasukan & pengeluaran dari Telegram tanpa perlu mengubah kodingan.
-
-- **🛡️ Admin Utama Multi-User**
-  Admin utama (`dapxtr`) dapat melihat statistik global, daftar user, serta memblokir atau mengaktifkan user.
-
 - **📑 Export Laporan PDF & CSV (Excel)**
   - **📄 PDF Report:** Dokumen rapi berisi ringkasan saldo dan tabel rincian transaksi lengkap dengan kolom Nomor Urut (`No.`).
-  - **📊 CSV File:** Format spreadsheet yang siap dibuka di Microsoft Excel / Google Sheets.
+  - **📊 CSV File:** Format file laporan rapi yang siap dibuka di Microsoft Excel atau aplikasi spreadsheet lainnya.
 
-- **📦 Backup Database Instan Khusus Admin**
-  Admin utama dapat mengunduh cadangan database `keuangan.db` yang berisi data semua user.
+- **📦 Backup Database Instan**
+  Dapat mengunduh cadangan database `keuangan.db` sewaktu-waktu.
 
 - **🔔 Pengingat Harian (Daily Reminder)**
   Pengingat otomatis harian setiap jam 20:00 WIB untuk mencatat pengeluaran.
@@ -64,6 +58,7 @@ Bot Telegram pintar, interaktif, dan fleksibel yang dirancang untuk membantu pen
 - **Database:** SQLite3 (Dilengkapi Indexing Kecepatan Tinggi `idx_tx_user_tgl` & `idx_tx_user_jenis`)
 - **PDF Generator:** `fpdf2`
 - **Graphic Generator:** `matplotlib` (Non-GUI Agg Backend)
+- **Environment Management:** `python-dotenv`
 
 ---
 
@@ -75,22 +70,23 @@ Pastikan Python 3.10+ sudah terinstal di komputer Anda.
 ### 2. Install Dependensi
 Buka terminal / Command Prompt pada folder proyek ini dan jalankan:
 ```bash
-pip install python-telegram-bot fpdf2 matplotlib
+pip install -r requirements.txt
 ```
 
-### 3. Mengatur Token Telegram Bot
-Anda bisa menggunakan file `.env` atau menyetel *environment variable*:
+### 3. Mengatur Konfigurasi (.env)
+Salin berkas `.env.example` menjadi `.env`:
 ```bash
 # Windows (PowerShell)
-$env:TELEGRAM_BOT_TOKEN="TOKEN_BOT_ANDA"
-$env:MAIN_ADMIN_USERNAME="dapxtr"
+Copy-Item .env.example .env
 
 # Linux / macOS
-export TELEGRAM_BOT_TOKEN="TOKEN_BOT_ANDA"
-export MAIN_ADMIN_USERNAME="dapxtr"
+cp .env.example .env
 ```
-
-Jika sudah tahu numeric Telegram ID admin, isi juga `MAIN_ADMIN_ID` agar admin tetap dikenali walaupun username berubah.
+Buka `.env` dan isi token Telegram Bot dari `@BotFather`:
+```env
+TELEGRAM_BOT_TOKEN="TOKEN_BOT_ANDA"
+ALLOWED_USER_ID="username_atau_id_anda"
+```
 
 ### 4. Menjalankan Bot
 Jalankan bot dengan perintah:
@@ -116,9 +112,11 @@ python bot.py
 
 ```text
 Bot-Keuangan/
+├── .env.example     # Template konfigurasi environment variable
 ├── bot.py           # Script utama bot Telegram
 ├── keuangan.db      # Database SQLite (dibuat otomatis saat bot dijalankan)
-└── README.md        # Dokumentasi proyek
+├── README.md        # Dokumentasi proyek
+└── requirements.txt # Daftar dependensi Python
 ```
 
 ---

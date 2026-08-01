@@ -1,7 +1,5 @@
-# Environment variables & Google Credentials (Sangat Rahasia)
+# Environment variables & Konfigurasi Rahasia
 .env
-credentials.json
-*.json
 
 # Database SQLite (Cadangan Data Keuangan Pribadi)
 *.db
