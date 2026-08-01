@@ -46,7 +46,11 @@ logging.basicConfig(
     CUSTOM_DATE_STATE,
     EDIT_NOMINAL_STATE,
     EDIT_KET_STATE,
-) = range(1, 7)
+    ADD_WALLET_NAME_STATE,
+    SET_WALLET_SALDO_STATE,
+    TRANSFER_WALLET_AMOUNT_STATE,
+    EDIT_WALLET_NAME_STATE,
+) = range(1, 11)
 
 # Token Bot Telegram & Authorization Whitelist
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -115,6 +119,10 @@ def match_flexible_command_intent(text: str) -> str:
         return "export"
     if any(k in clean for k in ["backup", "cadangan", "database"]):
         return "backup"
+    if any(k in clean for k in ["dompet", "wallet", "saldo dompet", "rekening"]):
+        return "dompet"
+    if any(k in clean for k in ["hutang", "piutang", "utang", "pinjaman"]):
+        return "hutang"
     if any(k in clean for k in ["help", "bantuan", "panduan", "cara pakai", "bantu", "tanya"]):
         return "bantuan"
     if any(k in clean for k in ["tambah pemasukan", "tambah masuk", "catat pemasukan"]):
@@ -237,6 +245,7 @@ def get_main_keyboard():
     keyboard = [
         [KeyboardButton("📊 Rekap Keuangan"), KeyboardButton("📈 Grafik Visual")],
         [KeyboardButton("📋 Riwayat Transaksi"), KeyboardButton("🎯 Set Budget")],
+        [KeyboardButton("💳 Dompet Saya"), KeyboardButton("🤝 Hutang & Piutang")],
         [KeyboardButton("📥 Tambah Pemasukan"), KeyboardButton("📤 Tambah Pengeluaran")],
         [KeyboardButton("📑 Export Laporan"), KeyboardButton("📦 Backup DB")],
         [KeyboardButton("❓ Bantuan"), KeyboardButton("❌ Batal")]
@@ -318,6 +327,8 @@ def init_db():
         columns = [column[1] for column in cursor.fetchall()]
         if "kategori" not in columns:
             cursor.execute("ALTER TABLE transaksi ADD COLUMN kategori TEXT DEFAULT 'Umum'")
+        if "wallet" not in columns:
+            cursor.execute("ALTER TABLE transaksi ADD COLUMN wallet TEXT DEFAULT '💵 Cash'")
 
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tx_user_tgl ON transaksi(user_id, tanggal)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tx_user_jenis ON transaksi(user_id, jenis)")
@@ -326,9 +337,14 @@ def init_db():
             CREATE TABLE IF NOT EXISTS settings (
                 user_id INTEGER PRIMARY KEY,
                 budget_bulanan REAL DEFAULT 0,
-                reminder_enabled INTEGER DEFAULT 1
+                reminder_enabled INTEGER DEFAULT 1,
+                wallet_initialized INTEGER DEFAULT 0
             )
         """)
+        cursor.execute("PRAGMA table_info(settings)")
+        s_cols = [c[1] for c in cursor.fetchall()]
+        if "wallet_initialized" not in s_cols:
+            cursor.execute("ALTER TABLE settings ADD COLUMN wallet_initialized INTEGER DEFAULT 0")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS custom_kategori (
@@ -338,7 +354,129 @@ def init_db():
                 nama_kategori TEXT
             )
         """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS wallets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                nama_wallet TEXT,
+                saldo REAL DEFAULT 0,
+                UNIQUE(user_id, nama_wallet)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hutang_piutang (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                jenis TEXT,
+                nama_pihak TEXT,
+                nominal REAL,
+                keterangan TEXT,
+                tanggal TIMESTAMP,
+                status TEXT DEFAULT 'Belum Lunas'
+            )
+        """)
         conn.commit()
+
+# --- ENGINE MULTI-DOMPET & WALLET HELPER ---
+DEFAULT_WALLETS = ["💵 Cash", "💳 Bank", "📱 E-Wallet"]
+
+def init_user_wallets(user_id: int):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT wallet_initialized FROM settings WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        is_init = row[0] if row else 0
+
+        if not is_init:
+            for w in DEFAULT_WALLETS:
+                cursor.execute(
+                    "INSERT OR IGNORE INTO wallets (user_id, nama_wallet, saldo) VALUES (?, ?, 0)",
+                    (user_id, w)
+                )
+            cursor.execute(
+                "INSERT INTO settings (user_id, wallet_initialized) VALUES (?, 1) ON CONFLICT(user_id) DO UPDATE SET wallet_initialized = 1",
+                (user_id,)
+            )
+            conn.commit()
+
+def get_user_wallets(user_id: int) -> dict:
+    init_user_wallets(user_id)
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT nama_wallet, saldo FROM wallets WHERE user_id = ?", (user_id,))
+        return dict(cursor.fetchall())
+
+def update_wallet_balance(user_id: int, wallet_name: str, change_amount: float):
+    init_user_wallets(user_id)
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE wallets SET saldo = saldo + ? WHERE user_id = ? AND nama_wallet = ?",
+            (change_amount, user_id, wallet_name)
+        )
+        conn.commit()
+
+def detect_wallet_from_text(text: str, user_id: int = 0) -> str:
+    wallets = get_user_wallets(user_id) if user_id else {}
+    clean = re.sub(r'[^\w\s]', '', text.lower())
+    
+    if wallets:
+        for w_name in wallets.keys():
+            w_clean = strip_emoji(w_name).lower().strip()
+            if w_clean and w_clean in clean:
+                return w_name
+            
+    ewallet_kw = ["gopay", "ovo", "dana", "shopeepay", "shopee", "linkaja", "ewallet", "e-wallet", "qris"]
+    bank_kw = ["bca", "mandiri", "bri", "bni", "cimb", "bank", "atm", "tf", "transfer", "rekening"]
+    
+    if any(k in clean for k in ewallet_kw):
+        if wallets:
+            for w_name in wallets.keys():
+                if any(kw in w_name.lower() for kw in ["e-wallet", "gopay", "ovo", "dana"]):
+                    return w_name
+        return "📱 E-Wallet"
+    elif any(k in clean for k in bank_kw):
+        if wallets:
+            for w_name in wallets.keys():
+                if any(kw in w_name.lower() for kw in ["bank", "bca", "mandiri", "bri"]):
+                    return w_name
+        return "💳 Bank"
+        
+    if wallets:
+        for w_name in wallets.keys():
+            if "cash" in w_name.lower() or "tunai" in w_name.lower():
+                return w_name
+        return list(wallets.keys())[0]
+    return "💵 Cash"
+
+# --- HELPER PARSER HUTANG & PIUTANG ---
+def detect_hutang_piutang(text: str):
+    low = text.lower().strip()
+    clean = re.sub(r'[^\w\s]', '', low)
+    
+    is_piutang = any(k in clean for k in ["pinjamkan", "kasih pinjam", "piutang", "utangin", "minjamin"])
+    is_hutang = any(k in clean for k in ["pinjam dari", "hutang ke", "utang ke", "pinjem dari", "hutang", "utang"])
+    
+    if not (is_piutang or is_hutang):
+        return None
+        
+    jenis = "Piutang" if is_piutang else "Hutang"
+    res = extract_nominal_from_sentence(text)
+    if not res:
+        return None
+        
+    nominal, ket, _ = res
+    nama = ket
+    for kw in ["pinjamkan", "kasih pinjam", "piutang", "utangin", "minjamin", "pinjam dari", "hutang ke", "utang ke", "pinjem dari", "hutang", "utang", "ke", "dari"]:
+        nama = re.sub(r'\b' + kw + r'\b', '', nama, flags=re.IGNORECASE).strip()
+    
+    nama = re.sub(r'\s+', ' ', nama).strip()
+    if not nama:
+        nama = "Tanpa Nama"
+        
+    return jenis, nominal, nama
 
 # Ambil Daftar Kategori Gabungan
 def get_user_categories(user_id: int, jenis: str) -> list:
@@ -357,16 +495,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user.first_name if update.effective_user else "Pengguna"
     pesan = (
         f"Halo <b>{user}</b>! Selamat datang di <b>Bot Catatan Keuangan Pribadi</b>. 💰📊\n\n"
-        "💡 <b>Pencatatan Otomatis:</b>\n"
+        "💡 <b>Pencatatan Otomatis & Cerdas:</b>\n"
         "Anda bisa langsung mengetik pesan obrolan santai:\n"
-        "• <code>beli ayam 15k</code> ➡️ Tercatat di SQLite!\n"
-        "• <code>dapat uang 1jt</code> ➡️ Tercatat di SQLite!\n\n"
+        "• <code>beli ayam 15k gopay</code> ➡️ Potong saldo E-Wallet!\n"
+        "• <code>pinjamkan 100k ke Budi</code> ➡️ Catat Piutang otomatis!\n\n"
         "<b>📌 Pilihan Menu Keyboard:</b>\n"
+        "• 💳 <b>Dompet Saya</b> - Cek saldo Cash, Bank & E-Wallet\n"
+        "• 🤝 <b>Hutang & Piutang</b> - Catat & pelunasan pinjaman\n"
         "• 📥 <b>Tambah Pemasukan</b> - Catat uang masuk per kategori\n"
         "• 📤 <b>Tambah Pengeluaran</b> - Catat pengeluaran per kategori\n"
-        "• 📊 <b>Rekap Keuangan</b> - Cek total saldo & rincian per kategori\n"
+        "• 📊 <b>Rekap Keuangan</b> - Cek total saldo & komparasi bulanan\n"
         "• 📈 <b>Grafik Visual</b> - Lihat grafik Pemasukan, Pengeluaran & Cashflow\n"
-        "• 📋 <b>Riwayat Transaksi</b> - Edit & Hapus transaksi langsung\n"
+        "• 📋 <b>Riwayat Transaksi</b> - Edit, Hapus & Set tanggal manual\n"
         "• 🎯 <b>Set Budget</b> - Peringatan sisa anggaran bulanan\n"
         "• 📑 <b>Export Laporan</b> - Unduh laporan Excel (CSV) & PDF\n"
         "• 📦 <b>Backup DB</b> - Unduh file cadangan database"
@@ -413,6 +553,12 @@ async def handle_if_menu_button(update: Update, context: ContextTypes.DEFAULT_TY
     elif intent == "backup":
         await backup_db(update, context)
         return True
+    elif intent == "dompet":
+        await wallet_panel(update, context)
+        return True
+    elif intent == "hutang":
+        await hutang_panel(update, context)
+        return True
     elif intent == "bantuan":
         await start(update, context)
         return True
@@ -429,29 +575,62 @@ async def handle_natural_text_message(update: Update, context: ContextTypes.DEFA
     if await handle_if_menu_button(update, context, text):
         return
 
+    user_id = update.effective_user.id
+    waktu_sekarang = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Cek NLP Hutang / Piutang
+    hp_res = detect_hutang_piutang(text)
+    if hp_res:
+        jenis_hp, nominal_hp, nama_pihak = hp_res
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO hutang_piutang (user_id, jenis, nama_pihak, nominal, keterangan, tanggal, status) VALUES (?, ?, ?, ?, ?, ?, 'Belum Lunas')",
+                (user_id, jenis_hp, nama_pihak, nominal_hp, text, waktu_sekarang)
+            )
+            hp_id = cursor.lastrowid
+            conn.commit()
+
+        icon = "🟢" if jenis_hp == "Piutang" else "🔴"
+        pesan_hp = (
+            f"✅ <b>Catatan {jenis_hp} Berhasil Disimpan!</b> #{hp_id}\n\n"
+            f"{icon} <b>Jenis:</b> {jenis_hp}\n"
+            f"👤 <b>Nama Pihak:</b> {nama_pihak}\n"
+            f"💰 <b>Nominal:</b> {format_rupiah(nominal_hp)}\n"
+            f"📅 <b>Waktu:</b> {waktu_sekarang}\n\n"
+            "💡 <i>Gunakan menu <b>🤝 Hutang & Piutang</b> untuk melihat atau menandai lunas.</i>"
+        )
+        await update.message.reply_text(pesan_hp, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
+        return
+
+    # Cek Transaksi Standar
     res = extract_nominal_from_sentence(text)
     if not res:
         return
 
     nominal, keterangan, original_text = res
-    user_id = update.effective_user.id
     jenis, kategori = detect_jenis_and_kategori(original_text, user_id)
-    waktu_sekarang = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    wallet = detect_wallet_from_text(original_text, user_id)
 
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO transaksi (user_id, jenis, nominal, keterangan, tanggal, kategori) VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, jenis, nominal, keterangan, waktu_sekarang, kategori)
+            "INSERT INTO transaksi (user_id, jenis, nominal, keterangan, tanggal, kategori, wallet) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, jenis, nominal, keterangan, waktu_sekarang, kategori, wallet)
         )
         tx_id = cursor.lastrowid
         conn.commit()
+
+    # Update saldo dompet
+    change = nominal if jenis == "Pemasukan" else -nominal
+    update_wallet_balance(user_id, wallet, change)
 
     emoji = "📥" if jenis == "Pemasukan" else "📤"
     pesan_sukses = (
         f"✅ <b>{jenis} Berhasil Dicatat Otomatis!</b> #{tx_id}\n\n"
         f"{emoji} <b>Nominal:</b> {format_rupiah(nominal)}\n"
         f"🏷️ <b>Kategori:</b> {kategori}\n"
+        f"💳 <b>Dompet:</b> {wallet}\n"
         f"📝 <b>Keterangan:</b> {keterangan}\n"
         f"📅 <b>Waktu:</b> {waktu_sekarang}"
     )
@@ -630,14 +809,71 @@ def get_rekap_keyboard():
             InlineKeyboardButton("🗓️ Bulan Ini", callback_data="rekap_this_month"),
         ],
         [
-            InlineKeyboardButton("📆 Pilih Bulan/Tahun", callback_data="rekap_custom_prompt"),
+            InlineKeyboardButton("📆 Pilih Tanggal/Bulan", callback_data="rekap_custom_prompt"),
             InlineKeyboardButton("♾️ Semua Waktu", callback_data="rekap_all"),
+        ],
+        [
+            InlineKeyboardButton("📊 Komparasi Bulan Ini vs Lalu", callback_data="rekap_monthly_comp")
         ],
         [
             InlineKeyboardButton("📈 Menu Grafik Visual", callback_data="chart_menu_prompt")
         ]
     ]
     return InlineKeyboardMarkup(keyboard)
+
+# Generator Komparasi Bulanan
+def get_monthly_comparison(user_id: int) -> str:
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            "SELECT SUM(nominal) FROM transaksi WHERE user_id = ? AND jenis = 'Pengeluaran' AND strftime('%Y-%m', tanggal) = strftime('%Y-%m', 'now', 'localtime')",
+            (user_id,)
+        )
+        keluar_ini = cursor.fetchone()[0] or 0.0
+
+        cursor.execute(
+            "SELECT SUM(nominal) FROM transaksi WHERE user_id = ? AND jenis = 'Pemasukan' AND strftime('%Y-%m', tanggal) = strftime('%Y-%m', 'now', 'localtime')",
+            (user_id,)
+        )
+        masuk_ini = cursor.fetchone()[0] or 0.0
+
+        cursor.execute(
+            "SELECT SUM(nominal) FROM transaksi WHERE user_id = ? AND jenis = 'Pengeluaran' AND strftime('%Y-%m', tanggal) = strftime('%Y-%m', 'now', 'localtime', '-1 month')",
+            (user_id,)
+        )
+        keluar_lalu = cursor.fetchone()[0] or 0.0
+
+        cursor.execute(
+            "SELECT SUM(nominal) FROM transaksi WHERE user_id = ? AND jenis = 'Pemasukan' AND strftime('%Y-%m', tanggal) = strftime('%Y-%m', 'now', 'localtime', '-1 month')",
+            (user_id,)
+        )
+        masuk_lalu = cursor.fetchone()[0] or 0.0
+
+    diff_keluar = keluar_ini - keluar_lalu
+    str_pct_keluar = f"{(diff_keluar / keluar_lalu * 100):+.1f}%" if keluar_lalu > 0 else "N/A"
+
+    diff_masuk = masuk_ini - masuk_lalu
+    str_pct_masuk = f"{(diff_masuk / masuk_lalu * 100):+.1f}%" if masuk_lalu > 0 else "N/A"
+
+    status_hemat = "🟢 <b>Lebih Hemat!</b>" if diff_keluar <= 0 else "🔴 <b>Lebih Boros!</b>"
+
+    pesan = (
+        "📊 <b>Analisis Komparasi Bulanan</b>\n"
+        "<i>(Membandingkan Bulan Ini vs Bulan Lalu)</i>\n"
+        "━━━━━━━━━━━━━━━━━━━\n\n"
+        "📤 <b>Pengeluaran:</b>\n"
+        f"• Bulan Lalu: {format_rupiah(keluar_lalu)}\n"
+        f"• Bulan Ini: {format_rupiah(keluar_ini)}\n"
+        f"• Selisih: <b>{format_rupiah(abs(diff_keluar))}</b> ({str_pct_keluar}) -> {status_hemat}\n\n"
+        "📥 <b>Pemasukan:</b>\n"
+        f"• Bulan Lalu: {format_rupiah(masuk_lalu)}\n"
+        f"• Bulan Ini: {format_rupiah(masuk_ini)}\n"
+        f"• Selisih: <b>{format_rupiah(abs(diff_masuk))}</b> ({str_pct_masuk})\n\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "💡 <i>Tips: Jaga pengeluaran bulan ini agar tetap terkontrol di bawah budget bulanan Anda!</i>"
+    )
+    return pesan
 
 def get_rekap_data(user_id: int, period: str = "this_month", custom_ym: str = None):
     with sqlite3.connect(DB_NAME) as conn:
@@ -744,16 +980,25 @@ async def rekap(update: Update, context: ContextTypes.DEFAULT_TYPE, period="this
 
     user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
     total_masuk, total_keluar, saldo, judul, breakdown = get_rekap_data(user_id, period, custom_ym)
+    wallets = get_user_wallets(user_id)
+    total_wallet_saldo = sum(wallets.values())
+
     saldo_emoji = "💰" if saldo >= 0 else "⚠️"
 
     pesan_rekap = (
         f"📊 <b>Ringkasan Keuangan ({judul})</b>\n"
         "━━━━━━━━━━━━━━━━━━━\n"
-        f"📥 <b>Total Pemasukan:</b> {format_rupiah(total_masuk)}\n"
-        f"📤 <b>Total Pengeluaran:</b> {format_rupiah(total_keluar)}\n"
+        f"📥 <b>Total Pemasukan Periode Ini:</b> {format_rupiah(total_masuk)}\n"
+        f"📤 <b>Total Pengeluaran Periode Ini:</b> {format_rupiah(total_keluar)}\n"
         "━━━━━━━━━━━━━━━━━━━\n"
-        f"{saldo_emoji} <b>Saldo Periode Ini:</b> <code>{format_rupiah(saldo)}</code>\n\n"
+        f"{saldo_emoji} <b>Cashflow Periode Ini:</b> <code>{format_rupiah(saldo)}</code>\n\n"
+        "💳 <b>Rincian Saldo Dompet & Rekening:</b>\n"
     )
+
+    for w_name, w_balance in wallets.items():
+        pesan_rekap += f"• {w_name}: <b>{format_rupiah(w_balance)}</b>\n"
+
+    pesan_rekap += f"👉 <b>Total Seluruh Saldo Real-time:</b> <code>{format_rupiah(total_wallet_saldo)}</code>\n\n"
 
     if breakdown:
         pesan_rekap += "🏷️ <b>Rincian Pengeluaran per Kategori:</b>\n"
@@ -1437,6 +1682,289 @@ async def riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE, period="to
             reply_markup=reply_markup
         )
 
+# --- PANEL DOMPET SAYA & MANAJER HUTANG PIUTANG ---
+async def wallet_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_authorized(update):
+        return
+
+    user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
+    wallets = get_user_wallets(user_id)
+    total_saldo = sum(wallets.values())
+
+    if not wallets:
+        pesan = (
+            "💳 <b>Dompet & Rekening Saya</b>\n"
+            "━━━━━━━━━━━━━━━━━━━\n"
+            "⚠️ <i>Belum ada dompet atau rekening. Silakan tekan <b>➕ Tambah Dompet Baru</b> di bawah!</i>"
+        )
+    else:
+        pesan = (
+            "💳 <b>Dompet & Rekening Saya</b>\n"
+            "━━━━━━━━━━━━━━━━━━━\n"
+        )
+        for name, balance in wallets.items():
+            pesan += f"• {name}: <b>{format_rupiah(balance)}</b>\n"
+        pesan += (
+            "━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 <b>Total Seluruh Saldo:</b> <code>{format_rupiah(total_saldo)}</code>\n\n"
+            "💡 <i>Gunakan nama dompet pada obrolan (misal: <code>50k makan gopay</code> atau <code>100k gaji bca</code>) untuk otomatis memilih dompet!</i>"
+        )
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Tambah Dompet Baru", callback_data="w_add_prompt")],
+        [
+            InlineKeyboardButton("✏️ Set Saldo Dompet", callback_data="w_set_select"),
+            InlineKeyboardButton("🏷️ Edit Nama Dompet", callback_data="w_editname_select")
+        ],
+        [
+            InlineKeyboardButton("🔄 Transfer Antar Dompet", callback_data="w_tf_select"),
+            InlineKeyboardButton("🗑️ Hapus Dompet", callback_data="w_del_select")
+        ]
+    ])
+
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(pesan, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    else:
+        await update.message.reply_text(pesan, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+# Handler CRUD Dompet
+async def prompt_add_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.answer()
+        await query.message.reply_text(
+            "➕ <b>Tambah Dompet / Rekening Baru</b>\n\n"
+            "Silakan kirimkan nama dompet/rekening baru yang ingin Anda buat.\n"
+            "<i>Contoh:</i> <code>💳 Bank BCA</code>, <code>📱 GoPay</code>, <code>💳 Mandiri</code>, atau <code>💵 Kas Saku</code>\n\n"
+            "💡 <i>Ketik atau tekan <b>❌ Batal</b> untuk membatalkan.</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_main_keyboard()
+        )
+    return ADD_WALLET_NAME_STATE
+
+async def simpan_add_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_authorized(update):
+        return ConversationHandler.END
+
+    text = update.message.text.strip()
+    if await handle_if_menu_button(update, context, text):
+        return ConversationHandler.END
+
+    user_id = update.effective_user.id
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR IGNORE INTO wallets (user_id, nama_wallet, saldo) VALUES (?, ?, 0)",
+            (user_id, text)
+        )
+        conn.commit()
+
+    await update.message.reply_text(
+        f"✅ Dompet / Rekening <b>{text}</b> berhasil ditambahkan!",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_main_keyboard()
+    )
+    await wallet_panel(update, context)
+    return ConversationHandler.END
+
+async def prompt_set_wallet_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.answer()
+        wallet_name = query.data.replace("w_set_name_", "")
+        context.user_data["target_wallet_name"] = wallet_name
+
+        await query.message.reply_text(
+            f"✏️ <b>Set Saldo Manual ({wallet_name})</b>\n\n"
+            "Silakan kirimkan nominal saldo baru untuk dompet ini.\n"
+            "<i>Contoh:</i> <code>2.500.000</code>, <code>2.5jt</code>, atau <code>0</code>\n\n"
+            "💡 <i>Ketik atau tekan <b>❌ Batal</b> untuk membatalkan.</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_main_keyboard()
+        )
+    return SET_WALLET_SALDO_STATE
+
+async def simpan_set_wallet_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_authorized(update):
+        return ConversationHandler.END
+
+    text = update.message.text.strip()
+    if await handle_if_menu_button(update, context, text):
+        return ConversationHandler.END
+
+    try:
+        nominal = parse_nominal(text)
+    except ValueError:
+        await update.message.reply_text("❌ Nominal angka tidak valid. Silakan coba lagi:")
+        return SET_WALLET_SALDO_STATE
+
+    wallet_name = context.user_data.get("target_wallet_name", "💵 Cash")
+    user_id = update.effective_user.id
+
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE wallets SET saldo = ? WHERE user_id = ? AND nama_wallet = ?",
+            (nominal, user_id, wallet_name)
+        )
+        conn.commit()
+
+    await update.message.reply_text(
+        f"✅ Saldo <b>{wallet_name}</b> berhasil diatur ke <b>{format_rupiah(nominal)}</b>!",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_main_keyboard()
+    )
+    await wallet_panel(update, context)
+    return ConversationHandler.END
+
+async def prompt_transfer_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.answer()
+        to_wallet = query.data.replace("w_tf_to_", "")
+        context.user_data["tf_to_wallet"] = to_wallet
+        from_wallet = context.user_data.get("tf_from_wallet", "")
+
+        await query.message.reply_text(
+            f"🔄 <b>Transfer Antar Dompet</b>\n\n"
+            f"Darimana: <b>{from_wallet}</b>\n"
+            f"Ke: <b>{to_wallet}</b>\n\n"
+            "Silakan kirimkan nominal yang ingin ditransfer.\n"
+            "<i>Contoh:</i> <code>100k</code>, <code>500.000</code>\n\n"
+            "💡 <i>Ketik atau tekan <b>❌ Batal</b> untuk membatalkan.</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_main_keyboard()
+        )
+    return TRANSFER_WALLET_AMOUNT_STATE
+
+async def simpan_transfer_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_authorized(update):
+        return ConversationHandler.END
+
+    text = update.message.text.strip()
+    if await handle_if_menu_button(update, context, text):
+        return ConversationHandler.END
+
+    try:
+        nominal = parse_nominal(text)
+    except ValueError:
+        await update.message.reply_text("❌ Nominal angka tidak valid. Silakan coba lagi:")
+        return TRANSFER_WALLET_AMOUNT_STATE
+
+    from_wallet = context.user_data.get("tf_from_wallet")
+    to_wallet = context.user_data.get("tf_to_wallet")
+    user_id = update.effective_user.id
+
+    update_wallet_balance(user_id, from_wallet, -nominal)
+    update_wallet_balance(user_id, to_wallet, nominal)
+
+    await update.message.reply_text(
+        f"✅ Berhasil mentransfer <b>{format_rupiah(nominal)}</b> dari <b>{from_wallet}</b> ke <b>{to_wallet}</b>!",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_main_keyboard()
+    )
+    await wallet_panel(update, context)
+    return ConversationHandler.END
+
+async def prompt_edit_wallet_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.answer()
+        wallet_name = query.data.replace("w_editname_item_", "")
+        context.user_data["target_edit_wallet_name"] = wallet_name
+
+        await query.message.reply_text(
+            f"🏷️ <b>Ubah Nama Dompet ({wallet_name})</b>\n\n"
+            "Silakan kirimkan nama dompet / rekening baru yang Anda inginkan.\n"
+            "<i>Contoh:</i> <code>💳 BCA Syariah</code>, <code>📱 GoPay Utama</code>, <code>💳 Bank Mandiri</code>\n\n"
+            "💡 <i>Ketik atau tekan <b>❌ Batal</b> untuk membatalkan.</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_main_keyboard()
+        )
+    return EDIT_WALLET_NAME_STATE
+
+async def simpan_edit_wallet_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_authorized(update):
+        return ConversationHandler.END
+
+    text = update.message.text.strip()
+    if await handle_if_menu_button(update, context, text):
+        return ConversationHandler.END
+
+    old_wallet_name = context.user_data.get("target_edit_wallet_name")
+    user_id = update.effective_user.id
+
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE wallets SET nama_wallet = ? WHERE user_id = ? AND nama_wallet = ?",
+            (text, user_id, old_wallet_name)
+        )
+        cursor.execute(
+            "UPDATE transaksi SET wallet = ? WHERE user_id = ? AND wallet = ?",
+            (text, user_id, old_wallet_name)
+        )
+        conn.commit()
+
+    await update.message.reply_text(
+        f"✅ Nama dompet <b>{old_wallet_name}</b> berhasil diubah menjadi <b>{text}</b>!",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_main_keyboard()
+    )
+    await wallet_panel(update, context)
+    return ConversationHandler.END
+
+async def hutang_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_authorized(update):
+        return
+
+    user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, jenis, nama_pihak, nominal, keterangan, tanggal FROM hutang_piutang WHERE user_id = ? AND status = 'Belum Lunas' ORDER BY id DESC",
+            (user_id,)
+        )
+        rows = cursor.fetchall()
+
+    if not rows:
+        pesan = "🤝 <b>Catatan Hutang & Piutang</b>\n\n🎉 <i>Tidak ada tanggungan hutang atau piutang aktif saat ini! Semua lunas.</i>\n\n💡 <i>Cukup ketik pesan seperti: <code>pinjamkan 100k ke Budi</code> atau <code>pinjam 50k dari Andi</code>.</i>"
+        keyboard = None
+    else:
+        pesan = "🤝 <b>Daftar Hutang & Piutang Aktif</b>\n\n"
+        buttons = []
+        tot_piutang = 0
+        tot_hutang = 0
+
+        for r in rows:
+            hp_id, jenis, nama, nom, ket, tgl = r
+            if jenis == "Piutang":
+                tot_piutang += nom
+                icon = "🟢"
+                desc = f"Berhutang ke Anda: <b>{nama}</b>"
+            else:
+                tot_hutang += nom
+                icon = "🔴"
+                desc = f"Anda berhutang ke: <b>{nama}</b>"
+
+            pesan += f"{icon} <b>#{hp_id} [{jenis}]</b> {format_rupiah(nom)}\n"
+            pesan += f"   👤 {desc}\n   📅 {tgl}\n\n"
+            buttons.append([InlineKeyboardButton(f"✅ Tandai Lunas #{hp_id}", callback_data=f"lunas_hp_{hp_id}")])
+
+        pesan += (
+            "━━━━━━━━━━━━━━━━━━━\n"
+            f"🟢 Total Piutang (Uang di orang lain): <b>{format_rupiah(tot_piutang)}</b>\n"
+            f"🔴 Total Hutang (Tanggungan Anda): <b>{format_rupiah(tot_hutang)}</b>\n"
+        )
+        keyboard = InlineKeyboardMarkup(buttons)
+
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(pesan, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    else:
+        await update.message.reply_text(pesan, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
 # Callback Handler Umum
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_authorized(update):
@@ -1473,6 +2001,80 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "rekap_all":
         await query.answer()
         await rekap(update, context, period="all")
+    elif data == "rekap_monthly_comp":
+        await query.answer()
+        comp_msg = get_monthly_comparison(user_id)
+        await query.message.reply_text(comp_msg, parse_mode=ParseMode.HTML, reply_markup=get_rekap_keyboard())
+
+    elif data == "w_set_select":
+        await query.answer()
+        wallets = get_user_wallets(user_id)
+        buttons = []
+        for name in wallets.keys():
+            buttons.append([InlineKeyboardButton(f"✏️ Set Saldo {name}", callback_data=f"w_set_name_{name}")])
+        buttons.append([InlineKeyboardButton("🔙 Kembali", callback_data="w_back")])
+        await query.edit_message_text("✏️ Pilih dompet/rekening yang ingin diatur saldonya:", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data == "w_editname_select":
+        await query.answer()
+        wallets = get_user_wallets(user_id)
+        buttons = []
+        for name in wallets.keys():
+            buttons.append([InlineKeyboardButton(f"🏷️ Edit Nama {name}", callback_data=f"w_editname_item_{name}")])
+        buttons.append([InlineKeyboardButton("🔙 Kembali", callback_data="w_back")])
+        await query.edit_message_text("🏷️ Pilih dompet/rekening yang ingin diubah namanya:", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data == "w_tf_select":
+        await query.answer()
+        wallets = get_user_wallets(user_id)
+        buttons = []
+        for name in wallets.keys():
+            buttons.append([InlineKeyboardButton(f"Darimana: {name}", callback_data=f"w_tf_from_{name}")])
+        buttons.append([InlineKeyboardButton("🔙 Kembali", callback_data="w_back")])
+        await query.edit_message_text("🔄 Pilih <b>Dompet Asal</b> (sumber dana):", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("w_tf_from_"):
+        await query.answer()
+        from_wallet = data.replace("w_tf_from_", "")
+        context.user_data["tf_from_wallet"] = from_wallet
+        wallets = get_user_wallets(user_id)
+        buttons = []
+        for name in wallets.keys():
+            if name != from_wallet:
+                buttons.append([InlineKeyboardButton(f"Ke: {name}", callback_data=f"w_tf_to_{name}")])
+        buttons.append([InlineKeyboardButton("🔙 Kembali", callback_data="w_back")])
+        await query.edit_message_text(f"🔄 Transfer dari <b>{from_wallet}</b>.\nPilih <b>Dompet Tujuan</b>:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data == "w_del_select":
+        await query.answer()
+        wallets = get_user_wallets(user_id)
+        buttons = []
+        for name in wallets.keys():
+            buttons.append([InlineKeyboardButton(f"🗑️ Hapus {name}", callback_data=f"w_del_name_{name}")])
+        buttons.append([InlineKeyboardButton("🔙 Kembali", callback_data="w_back")])
+        await query.edit_message_text("🗑️ Pilih dompet/rekening yang ingin dihapus:", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("w_del_name_"):
+        wallet_name = data.replace("w_del_name_", "")
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM wallets WHERE user_id = ? AND nama_wallet = ?", (user_id, wallet_name))
+            conn.commit()
+        await query.answer(f"✅ Dompet {wallet_name} berhasil dihapus!", show_alert=True)
+        await wallet_panel(update, context)
+
+    elif data == "w_back":
+        await query.answer()
+        await wallet_panel(update, context)
+
+    elif data.startswith("lunas_hp_"):
+        hp_id = int(data.split("_")[2])
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE hutang_piutang SET status = 'Lunas' WHERE id = ? AND user_id = ?", (hp_id, user_id))
+            conn.commit()
+        await query.answer("✅ Catatan berhasil ditandai Lunas!", show_alert=True)
+        await hutang_panel(update, context)
 
     elif data.startswith("rw_"):
         await query.answer()
@@ -1669,6 +2271,10 @@ if __name__ == "__main__":
             CallbackQueryHandler(prompt_custom_date, pattern="^rw_custom_prompt$"),
             CallbackQueryHandler(prompt_edit_nominal, pattern="^doedit_nom_"),
             CallbackQueryHandler(prompt_edit_keterangan, pattern="^doedit_ket_"),
+            CallbackQueryHandler(prompt_add_wallet, pattern="^w_add_prompt$"),
+            CallbackQueryHandler(prompt_set_wallet_saldo, pattern="^w_set_name_"),
+            CallbackQueryHandler(prompt_edit_wallet_name, pattern="^w_editname_item_"),
+            CallbackQueryHandler(prompt_transfer_amount, pattern="^w_tf_to_"),
         ],
         states={
             KATEGORI_STATE: [
@@ -1680,6 +2286,10 @@ if __name__ == "__main__":
             CUSTOM_DATE_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, simpan_custom_date)],
             EDIT_NOMINAL_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, simpan_edit_nominal)],
             EDIT_KET_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, simpan_edit_keterangan)],
+            ADD_WALLET_NAME_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, simpan_add_wallet)],
+            SET_WALLET_SALDO_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, simpan_set_wallet_saldo)],
+            TRANSFER_WALLET_AMOUNT_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, simpan_transfer_amount)],
+            EDIT_WALLET_NAME_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, simpan_edit_wallet_name)],
         },
         fallbacks=[
             CommandHandler("batal", batal),
@@ -1696,11 +2306,15 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("riwayat", riwayat))
     app.add_handler(CommandHandler("export", prompt_export_menu))
     app.add_handler(CommandHandler("backup", backup_db))
+    app.add_handler(CommandHandler("dompet", wallet_panel))
+    app.add_handler(CommandHandler("hutang", hutang_panel))
     
     app.add_handler(MessageHandler(filters.Regex("^📊 Rekap Keuangan$"), rekap))
     app.add_handler(MessageHandler(filters.Regex("^📈 Grafik Visual$"), prompt_grafik_menu))
     app.add_handler(MessageHandler(filters.Regex("^📋 Riwayat Transaksi$"), riwayat))
     app.add_handler(MessageHandler(filters.Regex("^🎯 Set Budget$"), prompt_set_budget))
+    app.add_handler(MessageHandler(filters.Regex("^💳 Dompet Saya$"), wallet_panel))
+    app.add_handler(MessageHandler(filters.Regex("^🤝 Hutang & Piutang$"), hutang_panel))
     app.add_handler(MessageHandler(filters.Regex("^📑 Export Laporan$"), prompt_export_menu))
     app.add_handler(MessageHandler(filters.Regex("^📊 Export CSV$"), prompt_export_menu))
     app.add_handler(MessageHandler(filters.Regex("^📦 Backup DB$"), backup_db))

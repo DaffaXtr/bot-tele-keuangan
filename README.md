@@ -39,6 +39,21 @@ Bot Telegram pintar, interaktif, dan fleksibel yang dirancang untuk membantu pen
 - **🎯 Pengaturan Budget Bulanan**
   Fitur peringatan otomatis saat pengeluaran telah mencapai **80%** atau **melebihi (100%)** dari target budget bulanan yang diset.
 
+- **💳 Multi-Dompet & Rekening (CRUD & Transfer Antar Dompet)**
+  Melacak saldo secara terpisah dengan dukungan **CRUD lengkap**:
+  - **➕ Tambah Dompet Baru**: Bebas membuat nama dompet/rekening baru (misal: `💳 Bank BCA`, `📱 GoPay`, `💳 Mandiri`).
+  - **✏️ Set Saldo Manual**: Mengatur ulang nominal saldo per dompet sewaktu-waktu.
+  - **🏷️ Edit Nama Dompet**: Mengubah nama dompet/rekening yang sudah ada secara fleksibel.
+  - **🔄 Transfer Antar Dompet**: Mentransfer saldo dari satu dompet ke dompet lain.
+  - **🗑️ Hapus Dompet**: Menghapus rekening/dompet yang tidak lagi digunakan.
+  - **🤖 Auto-Detect**: Pilihan dompet dapat dibaca otomatis dari teks percakapan (misal: `50k makan gopay`, `100k gaji bca`).
+
+- **🤝 Manajer Hutang & Piutang**
+  Pencatatan otomatis tanggungan pinjaman (contoh: `pinjamkan 100k ke Budi` atau `pinjam 50k dari Andi`). Dilengkapi tombol **✅ Tandai Lunas** interaktif.
+
+- **📊 Analisis Komparatif Bulan Ini vs Bulan Lalu**
+  Membandingkan total pengeluaran dan pemasukan bulan ini vs bulan sebelumnya, lengkap dengan perhitungan selisih nominal dan indikator hemat/boros.
+
 - **📑 Export Laporan PDF & CSV (Excel)**
   - **📄 PDF Report:** Dokumen rapi berisi ringkasan saldo dan tabel rincian transaksi lengkap dengan kolom Nomor Urut (`No.`).
   - **📊 CSV File:** Format file laporan rapi yang siap dibuka di Microsoft Excel atau aplikasi spreadsheet lainnya.
