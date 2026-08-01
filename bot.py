@@ -50,7 +50,9 @@ logging.basicConfig(
     SET_WALLET_SALDO_STATE,
     TRANSFER_WALLET_AMOUNT_STATE,
     EDIT_WALLET_NAME_STATE,
-) = range(1, 11)
+    INPUT_HP_NAME_STATE,
+    INPUT_HP_NOMINAL_STATE,
+) = range(1, 13)
 
 # Token Bot Telegram & Authorization Whitelist
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -456,20 +458,33 @@ def detect_hutang_piutang(text: str):
     low = text.lower().strip()
     clean = re.sub(r'[^\w\s]', '', low)
     
-    is_piutang = any(k in clean for k in ["pinjamkan", "kasih pinjam", "piutang", "utangin", "minjamin"])
-    is_hutang = any(k in clean for k in ["pinjam dari", "hutang ke", "utang ke", "pinjem dari", "hutang", "utang"])
+    piutang_kw = ["pinjamkan", "kasih pinjam", "piutang", "utangin", "minjamin", "dipinjam", "dipinjamkan"]
+    hutang_kw = ["pinjam dari", "hutang ke", "utang ke", "pinjem dari", "hutang", "utang", "ngutang", "berhutang", "pinjam", "pinjem"]
+
+    has_piutang = any(k in clean for k in piutang_kw)
+    has_hutang = any(k in clean for k in hutang_kw)
     
-    if not (is_piutang or is_hutang):
+    if not (has_piutang or has_hutang):
         return None
         
-    jenis = "Piutang" if is_piutang else "Hutang"
     res = extract_nominal_from_sentence(text)
     if not res:
         return None
         
     nominal, ket, _ = res
+    
+    if has_piutang and not any(k in clean for k in ["hutang ke", "utang ke", "pinjam dari", "pinjem dari", "ngutang"]):
+        jenis = "Piutang"
+    else:
+        jenis = "Hutang"
+
     nama = ket
-    for kw in ["pinjamkan", "kasih pinjam", "piutang", "utangin", "minjamin", "pinjam dari", "hutang ke", "utang ke", "pinjem dari", "hutang", "utang", "ke", "dari"]:
+    remove_words = [
+        "pinjamkan", "kasih pinjam", "piutang", "utangin", "minjamin", "dipinjamkan", "dipinjam",
+        "pinjam dari", "hutang ke", "utang ke", "pinjem dari", "hutang", "utang", "ngutang", "berhutang", "pinjam", "pinjem",
+        "ke", "dari", "sama", "pada"
+    ]
+    for kw in remove_words:
         nama = re.sub(r'\b' + kw + r'\b', '', nama, flags=re.IGNORECASE).strip()
     
     nama = re.sub(r'\s+', ' ', nama).strip()
@@ -1344,6 +1359,15 @@ async def simpan_edit_nominal(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
+        cursor.execute("SELECT jenis, nominal, wallet FROM transaksi WHERE id = ? AND user_id = ?", (tx_id, user_id))
+        row = cursor.fetchone()
+        if row:
+            jenis, old_nominal, wallet = row
+            wallet = wallet if wallet else "💵 Cash"
+            diff = nominal - old_nominal
+            change = diff if jenis == "Pemasukan" else -diff
+            update_wallet_balance(user_id, wallet, change)
+
         cursor.execute("UPDATE transaksi SET nominal = ? WHERE id = ? AND user_id = ?", (nominal, tx_id, user_id))
         conn.commit()
 
@@ -1928,12 +1952,21 @@ async def hutang_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         rows = cursor.fetchall()
 
+    buttons = [
+        [
+            InlineKeyboardButton("🔴 Tambah Hutang Saya", callback_data="hp_add_hutang"),
+            InlineKeyboardButton("🟢 Tambah Piutang", callback_data="hp_add_piutang")
+        ]
+    ]
+
     if not rows:
-        pesan = "🤝 <b>Catatan Hutang & Piutang</b>\n\n🎉 <i>Tidak ada tanggungan hutang atau piutang aktif saat ini! Semua lunas.</i>\n\n💡 <i>Cukup ketik pesan seperti: <code>pinjamkan 100k ke Budi</code> atau <code>pinjam 50k dari Andi</code>.</i>"
-        keyboard = None
+        pesan = (
+            "🤝 <b>Catatan Hutang & Piutang</b>\n\n"
+            "🎉 <i>Tidak ada tanggungan hutang atau piutang aktif saat ini! Semua lunas.</i>\n\n"
+            "💡 <i>Gunakan tombol di atas untuk mencatat manual, atau ketik obrolan seperti: <code>utang 100k ke Budi</code> / <code>pinjamkan 50k ke Andi</code>!</i>"
+        )
     else:
         pesan = "🤝 <b>Daftar Hutang & Piutang Aktif</b>\n\n"
-        buttons = []
         tot_piutang = 0
         tot_hutang = 0
 
@@ -1957,13 +1990,98 @@ async def hutang_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🟢 Total Piutang (Uang di orang lain): <b>{format_rupiah(tot_piutang)}</b>\n"
             f"🔴 Total Hutang (Tanggungan Anda): <b>{format_rupiah(tot_hutang)}</b>\n"
         )
-        keyboard = InlineKeyboardMarkup(buttons)
+
+    keyboard = InlineKeyboardMarkup(buttons)
 
     if update.callback_query:
         await update.callback_query.answer()
         await update.callback_query.edit_message_text(pesan, parse_mode=ParseMode.HTML, reply_markup=keyboard)
     else:
         await update.message.reply_text(pesan, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+# Handler Form Input Hutang / Piutang
+async def prompt_add_hp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.answer()
+        jenis = "Hutang" if query.data == "hp_add_hutang" else "Piutang"
+        context.user_data["hp_jenis"] = jenis
+        
+        if jenis == "Hutang":
+            title = "🔴 <b>Catatan Hutang Baru (Tanggungan Anda)</b>"
+            desc = "Silakan kirimkan <b>nama orang / pihak</b> tempat Anda berhutang.\n<i>Contoh:</i> <code>Budi</code>, <code>Bank Mandiri</code>, <code>Ahmad</code>"
+        else:
+            title = "🟢 <b>Catatan Piutang Baru (Uang Anda di Orang Lain)</b>"
+            desc = "Silakan kirimkan <b>nama orang / pihak</b> yang meminjam uang dari Anda.\n<i>Contoh:</i> <code>Budi</code>, <code>Siti</code>, <code>Doni</code>"
+
+        await query.message.reply_text(
+            f"{title}\n\n{desc}\n\n💡 <i>Ketik atau tekan <b>❌ Batal</b> untuk membatalkan.</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_main_keyboard()
+        )
+    return INPUT_HP_NAME_STATE
+
+async def simpan_hp_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_authorized(update):
+        return ConversationHandler.END
+
+    text = update.message.text.strip()
+    if await handle_if_menu_button(update, context, text):
+        return ConversationHandler.END
+
+    context.user_data["hp_nama_pihak"] = text
+    jenis = context.user_data.get("hp_jenis", "Hutang")
+
+    await update.message.reply_text(
+        f"💰 <b>Nominal {jenis} ({text})</b>\n\n"
+        "Silakan kirimkan nominal angkanya.\n"
+        "<i>Contoh:</i> <code>100k</code>, <code>1.500.000</code>, <code>50rb</code>\n\n"
+        "💡 <i>Ketik atau tekan <b>❌ Batal</b> untuk membatalkan.</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_main_keyboard()
+    )
+    return INPUT_HP_NOMINAL_STATE
+
+async def simpan_hp_nominal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_authorized(update):
+        return ConversationHandler.END
+
+    text = update.message.text.strip()
+    if await handle_if_menu_button(update, context, text):
+        return ConversationHandler.END
+
+    try:
+        nominal = parse_nominal(text)
+    except ValueError:
+        await update.message.reply_text("❌ Nominal angka tidak valid. Silakan kirimkan lagi (misal: <code>100k</code>):")
+        return INPUT_HP_NOMINAL_STATE
+
+    jenis = context.user_data.get("hp_jenis", "Hutang")
+    nama_pihak = context.user_data.get("hp_nama_pihak", "Tanpa Nama")
+    user_id = update.effective_user.id
+    waktu_sekarang = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO hutang_piutang (user_id, jenis, nama_pihak, nominal, keterangan, tanggal, status) VALUES (?, ?, ?, ?, ?, ?, 'Belum Lunas')",
+            (user_id, jenis, nama_pihak, nominal, f"{jenis} ke {nama_pihak}", waktu_sekarang)
+        )
+        hp_id = cursor.lastrowid
+        conn.commit()
+
+    icon = "🔴" if jenis == "Hutang" else "🟢"
+    await update.message.reply_text(
+        f"✅ <b>Catatan {jenis} Berhasil Disimpan!</b> #{hp_id}\n\n"
+        f"{icon} <b>Jenis:</b> {jenis}\n"
+        f"👤 <b>Nama Pihak:</b> {nama_pihak}\n"
+        f"💰 <b>Nominal:</b> {format_rupiah(nominal)}\n"
+        f"📅 <b>Waktu:</b> {waktu_sekarang}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_main_keyboard()
+    )
+    await hutang_panel(update, context)
+    return ConversationHandler.END
 
 # Callback Handler Umum
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2226,6 +2344,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         with sqlite3.connect(DB_NAME) as conn:
             cursor = conn.cursor()
+            cursor.execute("SELECT jenis, nominal, wallet FROM transaksi WHERE id = ? AND user_id = ?", (tx_id, user_id))
+            row = cursor.fetchone()
+            if row:
+                jenis, nominal, wallet = row
+                wallet = wallet if wallet else "💵 Cash"
+                change = -nominal if jenis == "Pemasukan" else nominal
+                update_wallet_balance(user_id, wallet, change)
+
             cursor.execute("DELETE FROM transaksi WHERE id = ? AND user_id = ?", (tx_id, user_id))
             conn.commit()
 
@@ -2275,6 +2401,7 @@ if __name__ == "__main__":
             CallbackQueryHandler(prompt_set_wallet_saldo, pattern="^w_set_name_"),
             CallbackQueryHandler(prompt_edit_wallet_name, pattern="^w_editname_item_"),
             CallbackQueryHandler(prompt_transfer_amount, pattern="^w_tf_to_"),
+            CallbackQueryHandler(prompt_add_hp, pattern="^hp_add_"),
         ],
         states={
             KATEGORI_STATE: [
@@ -2290,6 +2417,8 @@ if __name__ == "__main__":
             SET_WALLET_SALDO_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, simpan_set_wallet_saldo)],
             TRANSFER_WALLET_AMOUNT_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, simpan_transfer_amount)],
             EDIT_WALLET_NAME_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, simpan_edit_wallet_name)],
+            INPUT_HP_NAME_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, simpan_hp_name)],
+            INPUT_HP_NOMINAL_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, simpan_hp_nominal)],
         },
         fallbacks=[
             CommandHandler("batal", batal),
